@@ -1,0 +1,6 @@
+{
+  "name": "Ajaz×tiktok",
+  "description": "A premium native Android network profile client and VpnService utility with subscription YAML parser, leak protection, and profile management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
