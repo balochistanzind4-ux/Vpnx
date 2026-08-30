@@ -249,7 +249,7 @@ class WebSocketInputStream(
             val byte1 = rawIn.read()
             val byte2 = rawIn.read()
             if (byte1 < 0 || byte2 < 0) throw EOFException("Unexpected EOF reading 16-bit payload length")
-            payloadLen = ((byte1 and 0xFF) shl 8) or (byte2 and 0xFF).toLong()
+              payloadLen = (((byte1 and 0xFF) shl 8) or (byte2 and 0xFF)).toLong()
         } else if (payloadLen == 127L) {
             var lenVal = 0L
             for (i in 0 until 8) {
