@@ -177,6 +177,7 @@ fun MainAppContent(
             when (currentTab) {
                 0 -> HomeScreen(
                     viewModel = viewModel,
+                    onRequestVpnPermission = onRequestVpnPermission,
                     onNavigateProfiles = { currentTab = 1 }
                 )
                 1 -> ProfileScreen(viewModel = viewModel)

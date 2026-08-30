@@ -12,6 +12,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -48,6 +49,7 @@ class TcpProxySession(
     private var socketIn: InputStream? = null
     private var socketOut: OutputStream? = null
 
+    private val pendingPayloads = ConcurrentLinkedQueue<ByteArray>()
     private val isClosed = AtomicBoolean(false)
     private var readerJob: Job? = null
 
@@ -85,8 +87,18 @@ class TcpProxySession(
                     )
                     proxySocket = socket
                     socketIn = socket.getInputStream()
-                    socketOut = socket.getOutputStream()
+                    val out = socket.getOutputStream()
+                    socketOut = out
                     state = State.ESTABLISHED
+
+                    // Flush any payload packets that arrived while connecting
+                    while (pendingPayloads.isNotEmpty()) {
+                        val queued = pendingPayloads.poll() ?: break
+                        out.write(queued)
+                        out.flush()
+                        onTraffic(0, queued.size.toLong())
+                    }
+
                     startProxyReaderLoop()
                 } catch (e: Exception) {
                     AppLogger.w("TcpSession", "Failed to connect tunnel for $dstAddress:$dstPort: ${e.message}")
@@ -115,6 +127,8 @@ class TcpProxySession(
                         close()
                     }
                 }
+            } else if (state == State.CONNECTING || state == State.SYN_RECEIVED) {
+                pendingPayloads.add(payload)
             }
         }
     }
@@ -147,7 +161,6 @@ class TcpProxySession(
     }
 
     private fun sendSynAck() {
-        mySeqNum++
         val reply = IpPacket.createTcpPacket(
             srcIp = dstIp,
             dstIp = srcIp,
@@ -157,6 +170,7 @@ class TcpProxySession(
             ackNumber = clientAckNum,
             flags = 0x12 // SYN (0x02) | ACK (0x10)
         )
+        mySeqNum++
         writeToTun(reply)
     }
 
@@ -166,7 +180,7 @@ class TcpProxySession(
             dstIp = srcIp,
             srcPort = dstPort,
             dstPort = srcPort,
-            seqNumber = mySeqNum + 1,
+            seqNumber = mySeqNum,
             ackNumber = clientAckNum,
             flags = 0x10 // ACK (0x10)
         )
@@ -179,7 +193,7 @@ class TcpProxySession(
             dstIp = srcIp,
             srcPort = dstPort,
             dstPort = srcPort,
-            seqNumber = mySeqNum + 1,
+            seqNumber = mySeqNum,
             ackNumber = clientAckNum,
             flags = 0x18, // PSH (0x08) | ACK (0x10)
             payload = data
@@ -194,10 +208,11 @@ class TcpProxySession(
             dstIp = srcIp,
             srcPort = dstPort,
             dstPort = srcPort,
-            seqNumber = mySeqNum + 1,
+            seqNumber = mySeqNum,
             ackNumber = clientAckNum,
             flags = 0x11 // FIN (0x01) | ACK (0x10)
         )
+        mySeqNum++
         writeToTun(reply)
     }
 
@@ -207,7 +222,7 @@ class TcpProxySession(
             dstIp = srcIp,
             srcPort = dstPort,
             dstPort = srcPort,
-            seqNumber = mySeqNum + 1,
+            seqNumber = mySeqNum,
             ackNumber = ackNum,
             flags = 0x10 // ACK (0x10)
         )

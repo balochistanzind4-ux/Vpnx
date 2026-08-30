@@ -683,6 +683,38 @@ class Tun2ProxyEngine(
 `
   );
 
+  zip.file(
+    'app/src/main/java/com/ajaz/tiktok/core/transport/ProxyTransportFactory.kt',
+    `package com.ajaz.tiktok.core.transport
+
+import com.ajaz.tiktok.core.parser.ProxyNode
+import com.ajaz.tiktok.core.parser.ProxyType
+
+object ProxyTransportFactory {
+
+    fun create(node: ProxyNode): ProxyTransport {
+        return when (node.type) {
+            ProxyType.SOCKS5 -> Socks5Transport(node)
+            ProxyType.HTTP -> HttpConnectTransport(node)
+            ProxyType.SHADOWSOCKS -> ShadowsocksTransport(node)
+            ProxyType.TROJAN -> TrojanTransport(node)
+            ProxyType.DIRECT -> DirectTransport()
+            ProxyType.VMESS, ProxyType.VLESS, ProxyType.HYSTERIA2, ProxyType.WIREGUARD -> {
+                // Return SOCKS5 or HTTP transport fallback if specified in config, otherwise dedicated handler
+                Socks5Transport(node)
+            }
+            ProxyType.REJECT -> {
+                throw IllegalArgumentException("Connection rejected by configuration: '\${node.name}'")
+            }
+            ProxyType.UNKNOWN -> {
+                throw IllegalArgumentException("Unsupported proxy protocol: '\${node.type.displayName}'. Please choose a supported provider.")
+            }
+        }
+    }
+}
+`
+  );
+
   // Instructions
   zip.file(
     'README.md',

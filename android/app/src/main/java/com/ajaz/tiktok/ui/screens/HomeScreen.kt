@@ -1,5 +1,6 @@
 package com.ajaz.tiktok.ui.screens
 
+import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -78,6 +79,7 @@ import com.ajaz.tiktok.ui.viewmodel.MainViewModel
 @Composable
 fun HomeScreen(
     viewModel: MainViewModel,
+    onRequestVpnPermission: (Intent) -> Unit,
     onNavigateProfiles: () -> Unit
 ) {
     val vpnState by viewModel.vpnState.collectAsState()
@@ -147,7 +149,7 @@ fun HomeScreen(
             state = vpnState,
             onClick = {
                 viewModel.toggleConnection { prepareIntent ->
-                    // Request system consent via activity
+                    onRequestVpnPermission(prepareIntent)
                 }
             }
         )
