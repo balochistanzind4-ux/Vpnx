@@ -173,7 +173,7 @@ fun HomeScreen(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = s.serverAddress,
+                    text = if (!s.exitIp.isNullOrBlank()) "Exit IP: ${s.exitIp} (${s.serverAddress})" else s.serverAddress,
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextSecondary
                 )

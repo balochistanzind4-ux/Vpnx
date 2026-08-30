@@ -7,6 +7,7 @@ sealed class VpnState(val statusName: String) {
         val profileName: String,
         val serverName: String,
         val serverAddress: String,
+        val exitIp: String? = null,
         val connectedSince: Long = System.currentTimeMillis()
     ) : VpnState("Connected")
     object Stopping : VpnState("Stopping")

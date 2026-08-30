@@ -185,6 +185,7 @@ class AjazVpnService : VpnService() {
                     profileName = activeProfileName,
                     serverName = activeServerName,
                     serverAddress = activeServerAddress,
+                    exitIp = exitIp,
                     connectedSince = connectedTimestamp
                 )
                 VpnManager.updateState(connectedState)

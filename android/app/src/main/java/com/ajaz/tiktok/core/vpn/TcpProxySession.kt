@@ -6,13 +6,13 @@ import com.ajaz.tiktok.core.transport.ProxyTransportFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -49,9 +49,10 @@ class TcpProxySession(
     private var socketIn: InputStream? = null
     private var socketOut: OutputStream? = null
 
-    private val pendingPayloads = ConcurrentLinkedQueue<ByteArray>()
+    private val outboundChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val isClosed = AtomicBoolean(false)
     private var readerJob: Job? = null
+    private var writerJob: Job? = null
 
     val lastActivityTime = AtomicLong(System.currentTimeMillis())
 
@@ -69,66 +70,68 @@ class TcpProxySession(
             return
         }
 
-        if (packet.isSyn && state == State.SYN_RECEIVED) {
-            clientAckNum = packet.sequenceNumber + 1
-            // 1. Send SYN-ACK back to local client
-            sendSynAck()
+        if (packet.isSyn) {
+            if (state == State.SYN_RECEIVED) {
+                clientAckNum = packet.sequenceNumber + 1
+                sendSynAck()
 
-            // 2. Connect to remote proxy asynchronously
-            state = State.CONNECTING
-            scope.launch(Dispatchers.IO) {
-                try {
-                    val transport = ProxyTransportFactory.create(proxyNode)
-                    val socket = transport.openTunnel(
-                        targetHost = dstAddress,
-                        targetPort = dstPort,
-                        protectSocket = protectSocket,
-                        connectTimeoutMs = 12000
-                    )
-                    proxySocket = socket
-                    socketIn = socket.getInputStream()
-                    val out = socket.getOutputStream()
-                    socketOut = out
-                    state = State.ESTABLISHED
+                state = State.CONNECTING
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val transport = ProxyTransportFactory.create(proxyNode)
+                        val socket = transport.openTunnel(
+                            targetHost = dstAddress,
+                            targetPort = dstPort,
+                            protectSocket = protectSocket,
+                            connectTimeoutMs = 12000
+                        )
+                        proxySocket = socket
+                        socketIn = socket.getInputStream()
+                        val out = socket.getOutputStream()
+                        socketOut = out
+                        state = State.ESTABLISHED
 
-                    // Flush any payload packets that arrived while connecting
-                    while (pendingPayloads.isNotEmpty()) {
-                        val queued = pendingPayloads.poll() ?: break
-                        out.write(queued)
-                        out.flush()
-                        onTraffic(0, queued.size.toLong())
+                        startProxyWriterLoop(out)
+                        startProxyReaderLoop()
+                    } catch (e: Exception) {
+                        AppLogger.w("TcpSession", "Failed to connect tunnel for $dstAddress:$dstPort: ${e.message}")
+                        sendRst()
+                        close()
                     }
-
-                    startProxyReaderLoop()
-                } catch (e: Exception) {
-                    AppLogger.w("TcpSession", "Failed to connect tunnel for $dstAddress:$dstPort: ${e.message}")
-                    sendRst()
-                    close()
                 }
+            } else if (state == State.CONNECTING || state == State.ESTABLISHED) {
+                // Retransmitted SYN from client: re-send SYN-ACK without advancing sequence number
+                resendSynAck()
             }
             return
         }
 
-        // Handle regular payload data
+        // Handle client data packets
         val payload = packet.getPayload()
         if (payload.isNotEmpty()) {
             clientAckNum = packet.sequenceNumber + payload.size
             sendAck()
 
-            val out = socketOut
-            if (state == State.ESTABLISHED && out != null) {
-                scope.launch(Dispatchers.IO) {
-                    try {
-                        out.write(payload)
-                        out.flush()
-                        onTraffic(0, payload.size.toLong())
-                    } catch (e: Exception) {
-                        AppLogger.w("TcpSession", "Error forwarding data to proxy: ${e.message}")
-                        close()
-                    }
+            // Queue data for sequential writing to remote proxy
+            outboundChannel.trySend(payload)
+        }
+    }
+
+    private fun startProxyWriterLoop(out: OutputStream) {
+        writerJob = scope.launch(Dispatchers.IO) {
+            try {
+                for (chunk in outboundChannel) {
+                    if (isClosed.get()) break
+                    out.write(chunk)
+                    out.flush()
+                    onTraffic(0, chunk.size.toLong())
+                    lastActivityTime.set(System.currentTimeMillis())
                 }
-            } else if (state == State.CONNECTING || state == State.SYN_RECEIVED) {
-                pendingPayloads.add(payload)
+            } catch (e: Exception) {
+                if (!isClosed.get()) {
+                    AppLogger.w("TcpSession", "Socket write error on $dstAddress:$dstPort: ${e.message}")
+                    close()
+                }
             }
         }
     }
@@ -171,6 +174,19 @@ class TcpProxySession(
             flags = 0x12 // SYN (0x02) | ACK (0x10)
         )
         mySeqNum++
+        writeToTun(reply)
+    }
+
+    private fun resendSynAck() {
+        val reply = IpPacket.createTcpPacket(
+            srcIp = dstIp,
+            dstIp = srcIp,
+            srcPort = dstPort,
+            dstPort = srcPort,
+            seqNumber = mySeqNum - 1, // previous SYN seq num
+            ackNumber = clientAckNum,
+            flags = 0x12
+        )
         writeToTun(reply)
     }
 
@@ -256,7 +272,9 @@ class TcpProxySession(
     fun close() {
         if (isClosed.compareAndSet(false, true)) {
             state = State.CLOSED
+            outboundChannel.close()
             readerJob?.cancel()
+            writerJob?.cancel()
             try {
                 socketIn?.close()
                 socketOut?.close()

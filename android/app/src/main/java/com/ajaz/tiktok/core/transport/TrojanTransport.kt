@@ -4,14 +4,17 @@ import com.ajaz.tiktok.core.logger.AppLogger
 import com.ajaz.tiktok.core.parser.ProxyNode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.BufferedReader
 import java.io.IOException
+import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.MessageDigest
+import java.util.Base64
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
-import java.security.MessageDigest
 
 class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
 
@@ -37,6 +40,7 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         val rawSocket = Socket()
         protectSocket(rawSocket)
         rawSocket.tcpNoDelay = true
+        rawSocket.soTimeout = 30000
         rawSocket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
 
         // Upgrade to TLS
@@ -49,7 +53,48 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         sslSocket.sslParameters = sslParams
         sslSocket.startHandshake()
 
-        val out = sslSocket.getOutputStream()
+        var activeSocket: Socket = sslSocket
+
+        // Optional WebSocket upgrade
+        if (node.network.equals("ws", ignoreCase = true)) {
+            val out = activeSocket.getOutputStream()
+            val inStream = activeSocket.getInputStream()
+            val hostHeader = node.host ?: node.sni ?: node.server
+            val path = if (!node.path.isNullOrBlank()) node.path else "/"
+
+            val wsKeyBytes = ByteArray(16)
+            java.security.SecureRandom().nextBytes(wsKeyBytes)
+            val secKey = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                Base64.getEncoder().encodeToString(wsKeyBytes)
+            } else {
+                android.util.Base64.encodeToString(wsKeyBytes, android.util.Base64.NO_WRAP)
+            }
+
+            val wsRequest = "GET $path HTTP/1.1\r\n" +
+                "Host: $hostHeader\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Key: $secKey\r\n" +
+                "Sec-WebSocket-Version: 13\r\n" +
+                "User-Agent: AjazTiktok/1.0 (Trojan-WS)\r\n\r\n"
+
+            out.write(wsRequest.toByteArray(Charsets.US_ASCII))
+            out.flush()
+
+            val reader = BufferedReader(InputStreamReader(inStream, Charsets.US_ASCII))
+            val statusLine = reader.readLine() ?: throw IOException("Empty response during Trojan WebSocket upgrade")
+            if (!statusLine.contains("101")) {
+                throw IOException("Trojan WebSocket upgrade failed: $statusLine")
+            }
+
+            var line: String?
+            while (true) {
+                line = reader.readLine()
+                if (line.isNullOrEmpty()) break
+            }
+        }
+
+        val out = activeSocket.getOutputStream()
         val password = node.password ?: ""
         val hashHex = getPasswordHashHex(password)
 
@@ -66,7 +111,8 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         out.write(byteArrayOf(0x0D, 0x0A))
         out.flush()
 
-        return@withContext sslSocket
+        activeSocket.soTimeout = 0
+        return@withContext activeSocket
     }
 
     override suspend fun testConnection(
@@ -84,46 +130,3 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
     }
 }
 
-class ShadowsocksTransport(private val node: ProxyNode) : ProxyTransport {
-
-    override suspend fun openTunnel(
-        targetHost: String,
-        targetPort: Int,
-        protectSocket: (Socket) -> Boolean,
-        connectTimeoutMs: Int
-    ): Socket = withContext(Dispatchers.IO) {
-        val socket = Socket()
-        protectSocket(socket)
-        socket.tcpNoDelay = true
-        socket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
-
-        // Shadowsocks stream header: [Atyp: 0x03 (domain)] [len] [domain] [port: 2 bytes]
-        val out = socket.getOutputStream()
-        val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-        val header = ByteArray(1 + 1 + hostBytes.size + 2)
-        header[0] = 0x03 // Domain
-        header[1] = hostBytes.size.toByte()
-        System.arraycopy(hostBytes, 0, header, 2, hostBytes.size)
-        header[2 + hostBytes.size] = ((targetPort shr 8) and 0xFF).toByte()
-        header[2 + hostBytes.size + 1] = (targetPort and 0xFF).toByte()
-
-        out.write(header)
-        out.flush()
-
-        return@withContext socket
-    }
-
-    override suspend fun testConnection(
-        node: ProxyNode,
-        protectSocket: (Socket) -> Boolean,
-        timeoutMs: Int
-    ): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
-        try {
-            val socket = openTunnel("1.1.1.1", 80, protectSocket, timeoutMs)
-            socket.close()
-            Pair(true, null)
-        } catch (e: Exception) {
-            Pair(false, e.localizedMessage ?: "Shadowsocks node unreachable")
-        }
-    }
-}
