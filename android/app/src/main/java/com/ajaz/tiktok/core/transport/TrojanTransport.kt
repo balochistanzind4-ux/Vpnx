@@ -4,18 +4,24 @@ import com.ajaz.tiktok.core.logger.AppLogger
 import com.ajaz.tiktok.core.parser.ProxyNode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
-import java.io.IOException
-import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
-import java.util.Base64
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
+/**
+ * Standard Trojan Protocol Transport implementation.
+ * Supports Trojan authentication, TLS / SNI negotiation,
+ * and RFC 6455 WebSocket stream encapsulation.
+ */
 class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
 
     private fun getPasswordHashHex(password: String): ByteArray {
@@ -38,68 +44,53 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         connectTimeoutMs: Int
     ): Socket = withContext(Dispatchers.IO) {
         val rawSocket = Socket()
-        protectSocket(rawSocket)
+        val isProtected = protectSocket(rawSocket)
+        if (!isProtected) {
+            AppLogger.w("TrojanTransport", "Warning: VpnService.protect() returned false for raw socket")
+        }
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000
         rawSocket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
 
-        // Upgrade to TLS
-        val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-        val sniHost = node.sni ?: node.server
-        val sslSocket = sslFactory.createSocket(rawSocket, sniHost, node.port, true) as SSLSocket
+        var activeSocket: Socket = rawSocket
 
-        val sslParams = sslSocket.sslParameters ?: SSLParameters()
-        sslParams.serverNames = listOf(SNIHostName(sniHost))
-        sslSocket.sslParameters = sslParams
-        sslSocket.startHandshake()
-
-        var activeSocket: Socket = sslSocket
-
-        // Optional WebSocket upgrade
-        if (node.network.equals("ws", ignoreCase = true)) {
-            val out = activeSocket.getOutputStream()
-            val inStream = activeSocket.getInputStream()
-            val hostHeader = node.host ?: node.sni ?: node.server
-            val path = if (!node.path.isNullOrBlank()) node.path else "/"
-
-            val wsKeyBytes = ByteArray(16)
-            java.security.SecureRandom().nextBytes(wsKeyBytes)
-            val secKey = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                Base64.getEncoder().encodeToString(wsKeyBytes)
-            } else {
-                android.util.Base64.encodeToString(wsKeyBytes, android.util.Base64.NO_WRAP)
-            }
-
-            val wsRequest = "GET $path HTTP/1.1\r\n" +
-                "Host: $hostHeader\r\n" +
-                "Upgrade: websocket\r\n" +
-                "Connection: Upgrade\r\n" +
-                "Sec-WebSocket-Key: $secKey\r\n" +
-                "Sec-WebSocket-Version: 13\r\n" +
-                "User-Agent: AjazTiktok/1.0 (Trojan-WS)\r\n\r\n"
-
-            out.write(wsRequest.toByteArray(Charsets.US_ASCII))
-            out.flush()
-
-            val reader = BufferedReader(InputStreamReader(inStream, Charsets.US_ASCII))
-            val statusLine = reader.readLine() ?: throw IOException("Empty response during Trojan WebSocket upgrade")
-            if (!statusLine.contains("101")) {
-                throw IOException("Trojan WebSocket upgrade failed: $statusLine")
-            }
-
-            var line: String?
-            while (true) {
-                line = reader.readLine()
-                if (line.isNullOrEmpty()) break
-            }
+        // 1. Upgrade to TLS
+        val sniHost = (node.sni ?: node.host ?: node.server).trim()
+        val sslFactory: SSLSocketFactory = if (node.skipCertVerify) {
+            createInsecureSslSocketFactory()
+        } else {
+            SSLSocketFactory.getDefault() as SSLSocketFactory
         }
 
+        val sslSocket = sslFactory.createSocket(rawSocket, sniHost, node.port, true) as SSLSocket
+        val sslParams = sslSocket.sslParameters ?: SSLParameters()
+        try {
+            sslParams.serverNames = listOf(SNIHostName(sniHost))
+            if (!node.alpn.isNullOrEmpty()) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    sslParams.applicationProtocols = node.alpn.toTypedArray()
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w("TrojanTransport", "Failed to set SNI '$sniHost': ${e.message}")
+        }
+        sslSocket.sslParameters = sslParams
+        sslSocket.startHandshake()
+        activeSocket = sslSocket
+
+        // 2. WebSocket Upgrade if network is "ws"
+        if (node.network.equals("ws", ignoreCase = true)) {
+            val hostHeader = node.host ?: sniHost
+            val path = if (!node.path.isNullOrBlank()) node.path else "/"
+            activeSocket = WebSocketStreamWrapper(activeSocket, hostHeader, path, node.wsHeaders)
+        }
+
+        // 3. Write Trojan Request Header:
+        // [56 bytes hex(SHA224(password))] + [CRLF: 0x0D, 0x0A] + [Command: 0x01 (CONNECT)] + [Atyp: 0x03 (Domain)] + [Domain Len] + [Domain] + [Port: 2 bytes] + [CRLF]
         val out = activeSocket.getOutputStream()
-        val password = node.password ?: ""
+        val password = node.password ?: node.uuid ?: ""
         val hashHex = getPasswordHashHex(password)
 
-        // Trojan Request Header:
-        // [56 bytes hex(SHA224(password))] + [CRLF: 0x0D, 0x0A] + [Command: 0x01 (CONNECT)] + [Atyp: 0x03 (Domain)] + [Domain Len] + [Domain] + [Port: 2 bytes] + [CRLF]
         out.write(hashHex)
         out.write(byteArrayOf(0x0D, 0x0A, 0x01, 0x03)) // Command 1 = TCP CONNECT, Atyp 3 = Domain
 
@@ -113,6 +104,17 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
 
         activeSocket.soTimeout = 0
         return@withContext activeSocket
+    }
+
+    private fun createInsecureSslSocketFactory(): SSLSocketFactory {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAllCerts, SecureRandom())
+        return sslContext.socketFactory
     }
 
     override suspend fun testConnection(
@@ -129,4 +131,3 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         }
     }
 }
-

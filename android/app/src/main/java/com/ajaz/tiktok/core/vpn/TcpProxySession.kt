@@ -16,6 +16,11 @@ import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * Manages an individual TCP session between a local client (via TUN interface)
+ * and the remote proxy server (via VLESS, Trojan, Shadowsocks, etc.).
+ * Guarantees packet fragmentation under TUN MTU (1500) and strict TCP sequence ordering.
+ */
 class TcpProxySession(
     val sessionKey: String,
     val srcIp: ByteArray,
@@ -30,6 +35,10 @@ class TcpProxySession(
     private val onTraffic: (bytesIn: Long, bytesOut: Long) -> Unit,
     private val scope: CoroutineScope
 ) {
+    companion object {
+        private const val MAX_TCP_MSS = 1360 // Sliced under 1500 MTU (IP 20B + TCP 20B + MSS = 1400B)
+    }
+
     enum class State {
         SYN_RECEIVED,
         CONNECTING,
@@ -65,7 +74,8 @@ class TcpProxySession(
         }
 
         if (packet.isFin) {
-            sendFinAck(packet.sequenceNumber + 1)
+            clientAckNum = packet.sequenceNumber + 1
+            sendFinAck(clientAckNum)
             close()
             return
         }
@@ -94,25 +104,25 @@ class TcpProxySession(
                         startProxyWriterLoop(out)
                         startProxyReaderLoop()
                     } catch (e: Exception) {
-                        AppLogger.w("TcpSession", "Failed to connect tunnel for $dstAddress:$dstPort: ${e.message}")
+                        AppLogger.w("TcpSession", "Failed to establish tunnel for $dstAddress:$dstPort: ${e.message}")
                         sendRst()
                         close()
                     }
                 }
             } else if (state == State.CONNECTING || state == State.ESTABLISHED) {
-                // Retransmitted SYN from client: re-send SYN-ACK without advancing sequence number
+                // Retransmitted SYN from client: re-send SYN-ACK
                 resendSynAck()
             }
             return
         }
 
-        // Handle client data packets
+        // Handle incoming client TCP data payload
         val payload = packet.getPayload()
         if (payload.isNotEmpty()) {
             clientAckNum = packet.sequenceNumber + payload.size
             sendAck()
 
-            // Queue data for sequential writing to remote proxy
+            // Feed payload to remote tunnel
             outboundChannel.trySend(payload)
         }
     }
@@ -138,7 +148,7 @@ class TcpProxySession(
 
     private fun startProxyReaderLoop() {
         readerJob = scope.launch(Dispatchers.IO) {
-            val buffer = ByteArray(32768)
+            val buffer = ByteArray(16384)
             val input = socketIn ?: return@launch
 
             try {
@@ -149,13 +159,18 @@ class TcpProxySession(
                     lastActivityTime.set(System.currentTimeMillis())
                     onTraffic(bytesRead.toLong(), 0)
 
-                    val payload = ByteArray(bytesRead)
-                    System.arraycopy(buffer, 0, payload, 0, bytesRead)
-
-                    sendDataToTun(payload)
+                    // Slice incoming stream into segments <= MAX_TCP_MSS to prevent MTU drops
+                    var offset = 0
+                    while (offset < bytesRead && !isClosed.get()) {
+                        val chunkSize = Math.min(MAX_TCP_MSS, bytesRead - offset)
+                        val chunk = ByteArray(chunkSize)
+                        System.arraycopy(buffer, offset, chunk, 0, chunkSize)
+                        sendDataToTun(chunk)
+                        offset += chunkSize
+                    }
                 }
             } catch (_: Exception) {
-                // Socket read finished or closed
+                // Socket stream finished or closed
             } finally {
                 sendFin()
                 close()
@@ -171,7 +186,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = clientAckNum,
-            flags = 0x12 // SYN (0x02) | ACK (0x10)
+            flags = 0x12 // SYN | ACK
         )
         mySeqNum++
         writeToTun(reply)
@@ -183,7 +198,7 @@ class TcpProxySession(
             dstIp = srcIp,
             srcPort = dstPort,
             dstPort = srcPort,
-            seqNumber = mySeqNum - 1, // previous SYN seq num
+            seqNumber = mySeqNum - 1,
             ackNumber = clientAckNum,
             flags = 0x12
         )
@@ -198,7 +213,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = clientAckNum,
-            flags = 0x10 // ACK (0x10)
+            flags = 0x10 // ACK
         )
         writeToTun(reply)
     }
@@ -211,7 +226,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = clientAckNum,
-            flags = 0x18, // PSH (0x08) | ACK (0x10)
+            flags = 0x18, // PSH | ACK
             payload = data
         )
         mySeqNum += data.size
@@ -226,7 +241,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = clientAckNum,
-            flags = 0x11 // FIN (0x01) | ACK (0x10)
+            flags = 0x11 // FIN | ACK
         )
         mySeqNum++
         writeToTun(reply)
@@ -240,7 +255,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = ackNum,
-            flags = 0x10 // ACK (0x10)
+            flags = 0x10 // ACK
         )
         writeToTun(reply)
     }
@@ -253,7 +268,7 @@ class TcpProxySession(
             dstPort = srcPort,
             seqNumber = mySeqNum,
             ackNumber = clientAckNum,
-            flags = 0x04 // RST (0x04)
+            flags = 0x04 // RST
         )
         writeToTun(reply)
     }

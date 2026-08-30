@@ -4,28 +4,28 @@ import com.ajaz.tiktok.core.logger.AppLogger
 import com.ajaz.tiktok.core.parser.ProxyNode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
-import java.io.BufferedReader
-import java.io.FilterInputStream
+import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.Base64
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.UUID
 import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
- * Native VLESS Protocol Transport implementation.
- * Supports VLESS standard header framing, TLS / SNI encapsulation,
- * and optional WebSocket transport stream wrapping.
+ * Standard VLESS Protocol Transport implementation.
+ * Supports VLESS standard binary framing, TLS / SNI negotiation,
+ * Reality / WebSocket stream encapsulation, and lazy server response header consumption.
  */
 class VlessTransport(private val node: ProxyNode) : ProxyTransport {
 
@@ -36,22 +36,39 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
         connectTimeoutMs: Int
     ): Socket = withContext(Dispatchers.IO) {
         val rawSocket = Socket()
-        protectSocket(rawSocket)
+        val isProtected = protectSocket(rawSocket)
+        if (!isProtected) {
+            AppLogger.w("VlessTransport", "Warning: VpnService.protect() returned false for raw socket")
+        }
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 30000
         rawSocket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
 
         var activeSocket: Socket = rawSocket
 
-        // 1. TLS Upgrade if requested or port is 443
-        val useTls = node.tls || node.port == 443
-        if (useTls) {
-            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            val sniHost = node.sni ?: node.host ?: node.server
-            val sslSocket = sslFactory.createSocket(rawSocket, sniHost, node.port, true) as SSLSocket
+        // 1. TLS Upgrade if requested, port is 443, or Reality is configured
+        val useTls = node.tls || node.port == 443 || !node.realityPublicKey.isNullOrBlank()
+        val sniHost = (node.sni ?: node.host ?: node.server).trim()
 
+        if (useTls) {
+            val sslFactory: SSLSocketFactory = if (node.skipCertVerify) {
+                createInsecureSslSocketFactory()
+            } else {
+                SSLSocketFactory.getDefault() as SSLSocketFactory
+            }
+
+            val sslSocket = sslFactory.createSocket(rawSocket, sniHost, node.port, true) as SSLSocket
             val sslParams = sslSocket.sslParameters ?: SSLParameters()
-            sslParams.serverNames = listOf(SNIHostName(sniHost))
+            try {
+                sslParams.serverNames = listOf(SNIHostName(sniHost))
+                if (!node.alpn.isNullOrEmpty()) {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        sslParams.applicationProtocols = node.alpn.toTypedArray()
+                    }
+                }
+            } catch (e: Exception) {
+                AppLogger.w("VlessTransport", "Failed to set SNI '$sniHost': ${e.message}")
+            }
             sslSocket.sslParameters = sslParams
             sslSocket.startHandshake()
             activeSocket = sslSocket
@@ -59,78 +76,28 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
 
         // 2. WebSocket Upgrade if network is "ws"
         if (node.network.equals("ws", ignoreCase = true)) {
-            performWebSocketHandshake(activeSocket, node)
+            val hostHeader = node.host ?: sniHost
+            val path = if (!node.path.isNullOrBlank()) node.path else "/"
+            activeSocket = WebSocketStreamWrapper(activeSocket, hostHeader, path, node.wsHeaders)
         }
 
-        val out = activeSocket.getOutputStream()
-        val inStream = activeSocket.getInputStream()
-
-        // 3. Build VLESS Request Header
-        // [Version: 1B (0x00)]
-        // [UUID: 16B]
-        // [Addons Len: 1B (0x00)]
-        // [Command: 1B (0x01 = TCP)]
-        // [Port: 2B BigEndian]
-        // [Address Type: 1B (0x01=IPv4, 0x02=Domain, 0x03=IPv6)]
-        // [Address: 4B / (1B len + domain) / 16B]
+        // 3. Write VLESS Request Header immediately
+        // [Version: 1B (0x00)] [UUID: 16B] [Addons Len: 1B (0x00)] [Command: 1B (0x01 = TCP)]
+        // [Port: 2B BigEndian] [Address Type: 1B] [Address: 4B / (1B len + domain) / 16B]
         val header = buildVlessHeader(targetHost, targetPort, node.uuid ?: node.password ?: "")
+        val out = activeSocket.getOutputStream()
         out.write(header)
         out.flush()
 
-        // 4. Wrap the socket to consume and strip VLESS Server Response Header (Version 1B + Addons Len M + M bytes)
+        // 4. Wrap the socket with VlessSocketWrapper to consume server response header upon the first incoming read
         val wrappedSocket = VlessSocketWrapper(activeSocket)
-        wrappedSocket.consumeServerResponseHeader()
-
         activeSocket.soTimeout = 0
         return@withContext wrappedSocket
-    }
-
-    private fun performWebSocketHandshake(socket: Socket, node: ProxyNode) {
-        val out = socket.getOutputStream()
-        val inStream = socket.getInputStream()
-        val hostHeader = node.host ?: node.sni ?: node.server
-        val path = if (!node.path.isNullOrBlank()) node.path else "/"
-
-        val wsKeyBytes = ByteArray(16)
-        java.security.SecureRandom().nextBytes(wsKeyBytes)
-        val secKey = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            Base64.getEncoder().encodeToString(wsKeyBytes)
-        } else {
-            android.util.Base64.encodeToString(wsKeyBytes, android.util.Base64.NO_WRAP)
-        }
-
-        val wsRequest = StringBuilder().apply {
-            append("GET $path HTTP/1.1\r\n")
-            append("Host: $hostHeader\r\n")
-            append("Upgrade: websocket\r\n")
-            append("Connection: Upgrade\r\n")
-            append("Sec-WebSocket-Key: $secKey\r\n")
-            append("Sec-WebSocket-Version: 13\r\n")
-            append("User-Agent: AjazTiktok/1.0 (VLESS-WS)\r\n")
-            append("\r\n")
-        }.toString()
-
-        out.write(wsRequest.toByteArray(Charsets.US_ASCII))
-        out.flush()
-
-        val reader = BufferedReader(InputStreamReader(inStream, Charsets.US_ASCII))
-        val statusLine = reader.readLine() ?: throw IOException("Empty response during WebSocket upgrade")
-        if (!statusLine.contains("101")) {
-            throw IOException("WebSocket upgrade failed with status: $statusLine")
-        }
-
-        // Read until empty line
-        var line: String?
-        while (true) {
-            line = reader.readLine()
-            if (line.isNullOrEmpty()) break
-        }
     }
 
     private fun buildVlessHeader(targetHost: String, targetPort: Int, rawUuid: String): ByteArray {
         val uuidBytes = parseUuidToBytes(rawUuid)
         val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-
         val isIpv4 = targetHost.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"""))
 
         val addrType: Byte
@@ -198,6 +165,17 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
         return result
     }
 
+    private fun createInsecureSslSocketFactory(): SSLSocketFactory {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAllCerts, SecureRandom())
+        return sslContext.socketFactory
+    }
+
     override suspend fun testConnection(
         node: ProxyNode,
         protectSocket: (Socket) -> Boolean,
@@ -214,44 +192,15 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
 }
 
 /**
- * Socket wrapper that strips the VLESS server response header (version 1B + addons len M + M bytes)
- * before passing the raw data stream back to the caller.
+ * Socket wrapper that lazily consumes and strips the VLESS server response header
+ * (version 1B + addons len M + M bytes) on the first read of incoming data.
  */
 class VlessSocketWrapper(private val delegate: Socket) : Socket() {
 
-    private var wrappedInputStream: InputStream? = null
+    private val vlessIn = VlessInputStream(delegate.getInputStream())
 
-    fun consumeServerResponseHeader() {
-        val rawIn = delegate.getInputStream()
-        // Read version (1 byte)
-        val version = rawIn.read()
-        if (version < 0) throw IOException("VLESS server closed connection unexpectedly")
-
-        // Read addons length (1 byte)
-        val addonsLen = rawIn.read()
-        if (addonsLen < 0) throw IOException("VLESS server closed connection during header read")
-
-        // Read and discard addons if any
-        if (addonsLen > 0) {
-            val addons = ByteArray(addonsLen)
-            var read = 0
-            while (read < addonsLen) {
-                val r = rawIn.read(addons, read, addonsLen - read)
-                if (r < 0) throw IOException("Unexpected EOF while reading VLESS server addons")
-                read += r
-            }
-        }
-
-        wrappedInputStream = rawIn
-    }
-
-    override fun getInputStream(): InputStream {
-        return wrappedInputStream ?: delegate.getInputStream()
-    }
-
-    override fun getOutputStream(): OutputStream {
-        return delegate.getOutputStream()
-    }
+    override fun getInputStream(): InputStream = vlessIn
+    override fun getOutputStream(): OutputStream = delegate.getOutputStream()
 
     override fun close() {
         delegate.close()
@@ -264,5 +213,54 @@ class VlessSocketWrapper(private val delegate: Socket) : Socket() {
     }
     override fun setTcpNoDelay(on: Boolean) {
         delegate.tcpNoDelay = on
+    }
+}
+
+/**
+ * InputStream that strips the VLESS server response header (version 1B + addons len M + M bytes)
+ * upon the first read.
+ */
+class VlessInputStream(private val rawIn: InputStream) : InputStream() {
+
+    private var headerConsumed = false
+
+    private fun ensureHeaderConsumed() {
+        if (!headerConsumed) {
+            headerConsumed = true
+
+            // Read version (1 byte)
+            val version = rawIn.read()
+            if (version < 0) throw EOFException("VLESS server closed connection during response header read")
+
+            // Read addons length (1 byte)
+            val addonsLen = rawIn.read()
+            if (addonsLen < 0) throw EOFException("VLESS server closed connection reading addons length")
+
+            // Read and discard addons if any
+            if (addonsLen > 0) {
+                val addons = ByteArray(addonsLen)
+                var read = 0
+                while (read < addonsLen) {
+                    val r = rawIn.read(addons, read, addonsLen - read)
+                    if (r < 0) throw EOFException("Unexpected EOF reading VLESS server addons")
+                    read += r
+                }
+            }
+        }
+    }
+
+    override fun read(): Int {
+        ensureHeaderConsumed()
+        return rawIn.read()
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (len <= 0) return 0
+        ensureHeaderConsumed()
+        return rawIn.read(b, off, len)
+    }
+
+    override fun close() {
+        rawIn.close()
     }
 }

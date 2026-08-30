@@ -47,6 +47,11 @@ data class ProxyNode(
     val sni: String? = null,
     val host: String? = null,
     val path: String? = null,
+    val wsHeaders: Map<String, String> = emptyMap(),
+    val alpn: List<String>? = null,
+    val realityPublicKey: String? = null,
+    val realityShortId: String? = null,
+    val skipCertVerify: Boolean = false,
     val udp: Boolean = true,
     val latencyMs: Long = -1,
     val isOnline: Boolean = true

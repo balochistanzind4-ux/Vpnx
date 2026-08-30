@@ -122,6 +122,7 @@ object ClashYamlParser {
         )
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun parseProxyItem(item: Map<*, *>): ProxyNode? {
         try {
             val name = item["name"]?.toString()?.trim() ?: "Unnamed Endpoint"
@@ -136,9 +137,51 @@ object ClashYamlParser {
             val alterId = (item["alterId"] as? Number)?.toInt() ?: 0
             val network = item["network"]?.toString()
             val tls = item["tls"] == true || item["tls"]?.toString()?.lowercase() == "true"
-            val sni = item["sni"]?.toString() ?: item["servername"]?.toString()
-            val host = item["host"]?.toString()
-            val path = (item["ws-path"] ?: item["path"])?.toString()
+            val sni = item["sni"]?.toString() ?: item["servername"]?.toString() ?: item["server-name"]?.toString()
+            var host = item["host"]?.toString()
+            var path = (item["ws-path"] ?: item["path"])?.toString()
+
+            val wsHeaders = mutableMapOf<String, String>()
+
+            // Parse ws-opts or ws-headers
+            val wsOpts = item["ws-opts"] as? Map<*, *>
+            if (wsOpts != null) {
+                val wsPath = wsOpts["path"]?.toString()
+                if (!wsPath.isNullOrBlank()) path = wsPath
+                val headers = wsOpts["headers"] as? Map<*, *>
+                headers?.forEach { (k, v) ->
+                    if (k != null && v != null) {
+                        wsHeaders[k.toString()] = v.toString()
+                        if (k.toString().equals("Host", ignoreCase = true)) {
+                            host = v.toString()
+                        }
+                    }
+                }
+            }
+
+            val rawWsHeaders = item["ws-headers"] as? Map<*, *>
+            rawWsHeaders?.forEach { (k, v) ->
+                if (k != null && v != null) {
+                    wsHeaders[k.toString()] = v.toString()
+                    if (k.toString().equals("Host", ignoreCase = true)) {
+                        host = v.toString()
+                    }
+                }
+            }
+
+            // ALPN
+            val alpnList = (item["alpn"] as? List<*>)?.mapNotNull { it?.toString() }
+
+            // Reality options
+            var realityPublicKey: String? = null
+            var realityShortId: String? = null
+            val realityOpts = item["reality-opts"] as? Map<*, *>
+            if (realityOpts != null) {
+                realityPublicKey = realityOpts["public-key"]?.toString()
+                realityShortId = realityOpts["short-id"]?.toString()
+            }
+
+            val skipCertVerify = item["skip-cert-verify"] == true || item["allowInsecure"] == true
             val udp = item["udp"] != false
 
             return ProxyNode(
@@ -156,6 +199,11 @@ object ClashYamlParser {
                 sni = sni,
                 host = host,
                 path = path,
+                wsHeaders = wsHeaders,
+                alpn = alpnList,
+                realityPublicKey = realityPublicKey,
+                realityShortId = realityShortId,
+                skipCertVerify = skipCertVerify,
                 udp = udp
             )
         } catch (e: Exception) {
@@ -171,7 +219,6 @@ object ClashYamlParser {
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.startsWith("- {") && trimmed.contains("name:") && trimmed.contains("server:")) {
-                // Inline YAML dictionary style: - {name: HK-01, server: 1.2.3.4, port: 443, type: ss}
                 try {
                     val content = trimmed.removePrefix("-").trim()
                     val yaml = Yaml(SafeConstructor(LoaderOptions()))
