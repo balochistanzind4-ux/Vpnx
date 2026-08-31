@@ -49,6 +49,10 @@ object UiHelpers {
             ProxyType.SOCKS5 -> AmberWarning
             ProxyType.HTTP -> Color(0xFF94A3B8)
             ProxyType.DIRECT -> Color(0xFF64748B)
+            ProxyType.HYSTERIA2 -> Color(0xFF22C55E)
+            ProxyType.WIREGUARD -> Color(0xFF06B6D4)
+            ProxyType.REJECT -> Color(0xFFEF4444)
+            ProxyType.UNKNOWN -> GoldGlow
         }
     }
 }
