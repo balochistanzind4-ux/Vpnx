@@ -112,32 +112,32 @@ object ConnectionVerifier {
         when (e) {
             is java.net.ConnectException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Remote server refused connection at ${node.server}:${node.port}",
-                    recoverySuggestion = "Verify the server port or select a different server from your profile"
+                    reason = "Unable to connect to this location",
+                    recoverySuggestion = "Please select another location from your profile"
                 )
             }
             is java.net.SocketTimeoutException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Connection timed out after ${timeoutMs / 1000}s",
-                    recoverySuggestion = "Server is unresponsive. Please check your network connection or select another node"
+                    reason = "Connection took too long to respond",
+                    recoverySuggestion = "Please check your internet connection or choose another location"
                 )
             }
             is java.net.UnknownHostException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Cannot resolve server domain '${node.server}'",
-                    recoverySuggestion = "Check your mobile/Wi-Fi connection or DNS settings"
+                    reason = "Unable to reach the selected location",
+                    recoverySuggestion = "Please check your internet connection or choose another location"
                 )
             }
             is UnsupportedOperationException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = e.message ?: "Protocol not supported",
-                    recoverySuggestion = "Please choose a VLESS, Trojan, Shadowsocks, SOCKS5, or HTTP node"
+                    reason = "This location is currently unavailable",
+                    recoverySuggestion = "Please select an alternative location from your profile"
                 )
             }
             else -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Handshake error: ${e.localizedMessage ?: "Failed to establish tunnel"}",
-                    recoverySuggestion = "Check your credentials or select an alternative node"
+                    reason = "Unable to establish a secure connection",
+                    recoverySuggestion = "Please select an alternative location from your profile"
                 )
             }
         }

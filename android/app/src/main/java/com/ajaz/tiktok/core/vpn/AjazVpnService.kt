@@ -82,9 +82,9 @@ class AjazVpnService : VpnService() {
 
         val profile = app.profileStorage.getActiveProfile()
         if (profile == null || !profile.isValid || profile.proxies.isEmpty()) {
-            val err = "No valid profile configured with usable servers"
+            val err = "No valid profile selected"
             AppLogger.e("VpnService", err)
-            VpnManager.updateState(VpnState.Error(err, "Import a valid subscription configuration"))
+            VpnManager.updateState(VpnState.Error(err, "Please select or import a profile"))
             stopSelf()
             return
         }
@@ -96,13 +96,13 @@ class AjazVpnService : VpnService() {
 
         AppLogger.i("VpnService", "Target Endpoint: ${node.name} [${node.type.displayName}] (${node.server}:${node.port})")
 
-        val notification = createNotification(VpnState.Connecting("Verifying server handshake..."))
+        val notification = createNotification(VpnState.Connecting("Connecting to secure location..."))
         startForeground(NOTIFICATION_ID, notification)
 
         serviceScope.launch {
             try {
                 // 1. Verify remote endpoint before declaring Connected state
-                VpnManager.updateState(VpnState.Connecting("Verifying tunnel with ${node.name}..."))
+                VpnManager.updateState(VpnState.Connecting("Connecting to ${node.name}..."))
 
                 val verifyResult = ConnectionVerifier.verifyTunnel(
                     node = node,
