@@ -132,6 +132,7 @@ fun MainAppContent(
                     .shadow(elevation = 12.dp, spotColor = Color.Black)
                     .border(
                         width = 1.dp,
+                        shape = RoundedCornerShape(12.dp),
                         brush = Brush.verticalGradient(
                             listOf(CardBorderLight.copy(alpha = 0.6f), Color.Transparent)
                         )
@@ -146,7 +147,6 @@ fun MainAppContent(
                         onClick = { currentTab = 0 },
                         icon = { Icon(Icons.Default.Home, contentDescription = "Dashboard") },
                         label = { Text("Dashboard", fontSize = 11.sp, fontWeight = if (currentTab == 0) FontWeight.Bold else FontWeight.Normal) },
-                        shape = RoundedCornerShape(12.dp),
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = GoldAccent,
                             selectedTextColor = GoldAccent,
@@ -160,7 +160,6 @@ fun MainAppContent(
                         onClick = { currentTab = 1 },
                         icon = { Icon(Icons.Default.ListAlt, contentDescription = "Profiles") },
                         label = { Text("Profiles", fontSize = 11.sp, fontWeight = if (currentTab == 1) FontWeight.Bold else FontWeight.Normal) },
-                        shape = RoundedCornerShape(12.dp),
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = GoldAccent,
                             selectedTextColor = GoldAccent,
@@ -174,7 +173,6 @@ fun MainAppContent(
                         onClick = { currentTab = 2 },
                         icon = { Icon(Icons.Default.AltRoute, contentDescription = "Logs") },
                         label = { Text("Diagnostics", fontSize = 11.sp, fontWeight = if (currentTab == 2) FontWeight.Bold else FontWeight.Normal) },
-                        shape = RoundedCornerShape(12.dp),
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = GoldAccent,
                             selectedTextColor = GoldAccent,
@@ -188,7 +186,6 @@ fun MainAppContent(
                         onClick = { currentTab = 3 },
                         icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
                         label = { Text("Settings", fontSize = 11.sp, fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
-                        shape = RoundedCornerShape(12.dp),
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = GoldAccent,
                             selectedTextColor = GoldAccent,
