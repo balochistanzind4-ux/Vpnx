@@ -132,7 +132,7 @@ fun MainAppContent(
                     .shadow(elevation = 12.dp, spotColor = Color.Black)
                     .border(
                         width = 1.dp,
-                        brush = Brush.verticalGradient(
+                        brush = Brush.verticalGradient(colors = 
                             listOf(CardBorderLight.copy(alpha = 0.6f), Color.Transparent)
                         )
                     )
