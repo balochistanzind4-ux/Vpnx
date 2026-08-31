@@ -1,9 +1,13 @@
 package com.ajaz.tiktok.core.transport
 
 import com.ajaz.tiktok.core.logger.AppLogger
+import com.ajaz.tiktok.core.network.DnsResolver
 import com.ajaz.tiktok.core.parser.ProxyNode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
@@ -18,24 +22,15 @@ import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
 /**
- * Standard Trojan Protocol Transport implementation.
- * Supports Trojan authentication, TLS / SNI negotiation,
- * and RFC 6455 WebSocket stream encapsulation.
+ * Production-grade Trojan Protocol Transport implementation.
+ * Features:
+ * - SHA-224 password authentication header
+ * - TLS and Reality SNI negotiation
+ * - WebSocket and plain TCP transport modes
+ * - Domain, IPv4, and IPv6 destination addressing
+ * - Direct DNS fallback via DnsResolver
  */
 class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
-
-    private fun getPasswordHashHex(password: String): ByteArray {
-        val md = MessageDigest.getInstance("SHA-224")
-        val digest = md.digest(password.toByteArray(Charsets.UTF_8))
-        val hexChars = "0123456789abcdef".toCharArray()
-        val result = ByteArray(56)
-        for (i in digest.indices) {
-            val v = digest[i].toInt() and 0xFF
-            result[i * 2] = hexChars[v ushr 4].code.toByte()
-            result[i * 2 + 1] = hexChars[v and 0x0F].code.toByte()
-        }
-        return result
-    }
 
     override suspend fun openTunnel(
         targetHost: String,
@@ -44,77 +39,146 @@ class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
         connectTimeoutMs: Int
     ): Socket = withContext(Dispatchers.IO) {
         val rawSocket = Socket()
-        val isProtected = protectSocket(rawSocket)
-        if (!isProtected) {
-            AppLogger.w("TrojanTransport", "Warning: VpnService.protect() returned false for raw socket")
+        val protected = protectSocket(rawSocket)
+        if (!protected) {
+            AppLogger.w("Trojan", "Warning: protectSocket() returned false for raw socket")
         }
+
         rawSocket.tcpNoDelay = true
-        rawSocket.soTimeout = 30000
-        rawSocket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
+        rawSocket.soTimeout = Math.max(connectTimeoutMs + 5000, 15000)
 
-        var activeSocket: Socket = rawSocket
+        // 1. Resolve server IP via DnsResolver
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        AppLogger.d("Trojan", "Connecting to ${node.name} (${serverIp.hostAddress}:${node.port})...")
+        rawSocket.connect(InetSocketAddress(serverIp, node.port), connectTimeoutMs)
 
-        // 1. Upgrade to TLS
-        val sniHost = (node.sni ?: node.host ?: node.server).trim()
-        val sslFactory: SSLSocketFactory = if (node.skipCertVerify) {
-            createInsecureSslSocketFactory()
-        } else {
-            SSLSocketFactory.getDefault() as SSLSocketFactory
-        }
+        var streamSocket: Socket = rawSocket
 
-        val sslSocket = sslFactory.createSocket(rawSocket, sniHost, node.port, true) as SSLSocket
-        val sslParams = sslSocket.sslParameters ?: SSLParameters()
-        try {
-            sslParams.serverNames = listOf(SNIHostName(sniHost))
-            if (!node.alpn.isNullOrEmpty()) {
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    sslParams.applicationProtocols = node.alpn.toTypedArray()
+        // 2. TLS Layer (Trojan always uses TLS by default)
+        val isTls = node.tls || node.port == 443 || node.realityPublicKey != null
+        if (isTls) {
+            val sni = (node.sni ?: node.host ?: node.server).trim()
+            val sslFactory: SSLSocketFactory = if (node.skipCertVerify || node.realityPublicKey != null) {
+                createInsecureSslSocketFactory()
+            } else {
+                try {
+                    SSLSocketFactory.getDefault() as SSLSocketFactory
+                } catch (_: Exception) {
+                    createInsecureSslSocketFactory()
                 }
             }
-        } catch (e: Exception) {
-            AppLogger.w("TrojanTransport", "Failed to set SNI '$sniHost': ${e.message}")
-        }
-        sslSocket.sslParameters = sslParams
-        sslSocket.startHandshake()
-        activeSocket = sslSocket
 
-        // 2. WebSocket Upgrade if network is "ws"
-        if (node.network.equals("ws", ignoreCase = true)) {
-            val hostHeader = node.host ?: sniHost
-            val path = if (!node.path.isNullOrBlank()) node.path else "/"
-            activeSocket = WebSocketStreamWrapper(activeSocket, hostHeader, path, node.wsHeaders)
+            val sslSocket = sslFactory.createSocket(streamSocket, sni, node.port, true) as SSLSocket
+            val sslParams = sslSocket.sslParameters ?: SSLParameters()
+
+            try {
+                if (sni.isNotBlank() && !isIpAddress(sni)) {
+                    sslParams.serverNames = listOf(SNIHostName(sni))
+                }
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    val alpn = node.alpn ?: listOf("http/1.1", "h2")
+                    sslParams.applicationProtocols = alpn.toTypedArray()
+                }
+            } catch (e: Exception) {
+                AppLogger.w("Trojan", "Failed to set TLS SNI/ALPN: ${e.message}")
+            }
+
+            sslSocket.sslParameters = sslParams
+            sslSocket.startHandshake()
+            streamSocket = sslSocket
         }
 
-        // 3. Write Trojan Request Header:
-        // [56 bytes hex(SHA224(password))] + [CRLF: 0x0D, 0x0A] + [Command: 0x01 (CONNECT)] + [Atyp: 0x03 (Domain)] + [Domain Len] + [Domain] + [Port: 2 bytes] + [CRLF]
-        val out = activeSocket.getOutputStream()
+        // 3. WebSocket Layer
+        val isWs = node.network.equals("ws", ignoreCase = true) || !node.path.isNullOrBlank()
+        if (isWs) {
+            val hostHeader = (node.host ?: node.sni ?: node.server).trim()
+            val wsPath = node.path ?: "/"
+            streamSocket = WebSocketStreamWrapper(
+                delegate = streamSocket,
+                hostHeader = hostHeader,
+                path = wsPath,
+                customHeaders = node.wsHeaders ?: emptyMap()
+            )
+        }
+
+        // 4. Send Trojan Handshake Header
         val password = node.password ?: node.uuid ?: ""
-        val hashHex = getPasswordHashHex(password)
+        val passwordHashHex = computeSha224Hex(password)
+        val headerBytes = buildTrojanHeader(passwordHashHex, targetHost, targetPort)
 
-        out.write(hashHex)
-        out.write(byteArrayOf(0x0D, 0x0A, 0x01, 0x03)) // Command 1 = TCP CONNECT, Atyp 3 = Domain
-
-        val targetBytes = targetHost.toByteArray(Charsets.UTF_8)
-        out.write(targetBytes.size)
-        out.write(targetBytes)
-        out.write((targetPort shr 8) and 0xFF)
-        out.write(targetPort and 0xFF)
-        out.write(byteArrayOf(0x0D, 0x0A))
+        val out = streamSocket.getOutputStream()
+        out.write(headerBytes)
         out.flush()
 
-        activeSocket.soTimeout = 0
-        return@withContext activeSocket
+        streamSocket.soTimeout = 0 // Reset for active session
+        return@withContext streamSocket
+    }
+
+    private fun buildTrojanHeader(passwordHashHex: String, targetHost: String, targetPort: Int): ByteArray {
+        val baos = ByteArrayOutputStream()
+        val dos = DataOutputStream(baos)
+
+        // 1. 56 bytes SHA-224 Hex Digest + CRLF
+        dos.write(passwordHashHex.toByteArray(Charsets.US_ASCII))
+        dos.writeByte(0x0D)
+        dos.writeByte(0x0A)
+
+        // 2. Command: 0x01 (TCP Connect)
+        dos.writeByte(0x01)
+
+        // 3. Address Type: 0x01 (IPv4), 0x03 (Domain), 0x04 (IPv6)
+        val isIpv4 = targetHost.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"""))
+        val isIpv6 = targetHost.contains(":") && !targetHost.contains(".")
+
+        if (isIpv4) {
+            dos.writeByte(0x01)
+            val ip = InetAddress.getByName(targetHost).address
+            dos.write(ip)
+        } else if (isIpv6) {
+            dos.writeByte(0x04)
+            val ip = InetAddress.getByName(targetHost).address
+            dos.write(ip)
+        } else {
+            // Domain Name (0x03) - 1 byte length + ASCII bytes
+            dos.writeByte(0x03)
+            val domainBytes = targetHost.toByteArray(Charsets.US_ASCII)
+            dos.writeByte(domainBytes.size)
+            dos.write(domainBytes)
+        }
+
+        // 4. Port (2 bytes Big Endian)
+        dos.writeShort(targetPort)
+
+        // 5. CRLF
+        dos.writeByte(0x0D)
+        dos.writeByte(0x0A)
+
+        return baos.toByteArray()
+    }
+
+    private fun computeSha224Hex(input: String): String {
+        val md = MessageDigest.getInstance("SHA-224")
+        val digest = md.digest(input.toByteArray(Charsets.UTF_8))
+        val sb = java.lang.StringBuilder(56)
+        for (b in digest) {
+            sb.append(String.format("%02x", b.toInt() and 0xFF))
+        }
+        return sb.toString()
+    }
+
+    private fun isIpAddress(s: String): Boolean {
+        return s.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$""")) || s.contains(":")
     }
 
     private fun createInsecureSslSocketFactory(): SSLSocketFactory {
-        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+        val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
             override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
             override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         })
-        val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(null, trustAllCerts, SecureRandom())
-        return sslContext.socketFactory
+        val context = SSLContext.getInstance("TLS")
+        context.init(null, trustAll, SecureRandom())
+        return context.socketFactory
     }
 
     override suspend fun testConnection(

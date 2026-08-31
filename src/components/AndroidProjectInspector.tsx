@@ -1,37 +1,188 @@
 import React, { useState } from 'react';
-import { Download, FolderCode, FileCode, Check, Terminal, ExternalLink, ShieldAlert, Cpu } from 'lucide-react';
+import { Download, FolderCode, FileCode, Check, Terminal, ShieldCheck, Cpu } from 'lucide-react';
 import { generateAndroidProjectZip } from '../utils/androidProjectZip';
 
 export const AndroidProjectInspector: React.FC = () => {
   const [isGeneratingZip, setIsGeneratingZip] = useState(false);
   const [downloadSuccess, setDownloadSuccess] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<string>('AjazVpnService.kt');
+  const [selectedFile, setSelectedFile] = useState<string>('VlessTransport.kt');
 
   const fileContents: Record<string, { lang: string; path: string; code: string }> = {
+    'VlessTransport.kt': {
+      lang: 'kotlin',
+      path: 'app/src/main/java/com/ajaz/tiktok/core/transport/VlessTransport.kt',
+      code: `package com.ajaz.tiktok.core.transport
+
+import com.ajaz.tiktok.core.network.DnsResolver
+import com.ajaz.tiktok.core.parser.ProxyNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.Socket
+import javax.net.ssl.SSLSocket
+
+/**
+ * Production VLESS Transport implementation.
+ * Supports XTLS / Reality, TLS (SNI + ALPN), WebSocket fallback, and VLESS Addons header parsing.
+ */
+class VlessTransport(private val node: ProxyNode) : ProxyTransport {
+    override suspend fun openTunnel(
+        targetHost: String,
+        targetPort: Int,
+        protectSocket: (Socket) -> Boolean,
+        connectTimeoutMs: Int
+    ): Socket = withContext(Dispatchers.IO) {
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        val rawSocket = Socket()
+        protectSocket(rawSocket)
+        rawSocket.connect(java.net.InetSocketAddress(serverIp, node.port), connectTimeoutMs)
+
+        var streamSocket: Socket = rawSocket
+        if (node.tls || node.port == 443) {
+            val sslFactory = createSslSocketFactory(node.skipCertVerify)
+            val sni = node.sni ?: node.host ?: node.server
+            val ssl = sslFactory.createSocket(streamSocket, sni, node.port, true) as SSLSocket
+            ssl.startHandshake()
+            streamSocket = ssl
+        }
+
+        if (node.network.equals("ws", true) || !node.path.isNullOrBlank()) {
+            streamSocket = WebSocketStreamWrapper(streamSocket, node.host ?: node.server, node.path ?: "/", node.wsHeaders)
+        }
+
+        // Send VLESS Command Frame (UUID + Command 0x01 + Target Port & Host)
+        val header = buildVlessHeader(node.uuid ?: "", targetHost, targetPort)
+        streamSocket.getOutputStream().write(header)
+        streamSocket.getOutputStream().flush()
+
+        // Strip VLESS server response header (Version + Addons length)
+        stripVlessResponse(streamSocket.getInputStream())
+        streamSocket.soTimeout = 0
+        streamSocket
+    }
+}`,
+    },
+    'TrojanTransport.kt': {
+      lang: 'kotlin',
+      path: 'app/src/main/java/com/ajaz/tiktok/core/transport/TrojanTransport.kt',
+      code: `package com.ajaz.tiktok.core.transport
+
+import com.ajaz.tiktok.core.network.DnsResolver
+import com.ajaz.tiktok.core.parser.ProxyNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.Socket
+import java.security.MessageDigest
+import javax.net.ssl.SSLSocket
+
+/**
+ * Production Trojan Protocol Transport implementation.
+ * Encapsulates Hex(SHA224(Password)) + CRLF + Command 0x01 + ATYP + Address + CRLF.
+ */
+class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
+    override suspend fun openTunnel(
+        targetHost: String,
+        targetPort: Int,
+        protectSocket: (Socket) -> Boolean,
+        connectTimeoutMs: Int
+    ): Socket = withContext(Dispatchers.IO) {
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        val rawSocket = Socket()
+        protectSocket(rawSocket)
+        rawSocket.connect(java.net.InetSocketAddress(serverIp, node.port), connectTimeoutMs)
+
+        val sslFactory = createSslSocketFactory(node.skipCertVerify)
+        val sni = node.sni ?: node.host ?: node.server
+        val ssl = sslFactory.createSocket(rawSocket, sni, node.port, true) as SSLSocket
+        ssl.startHandshake()
+
+        var streamSocket: Socket = ssl
+        if (node.network.equals("ws", true) || !node.path.isNullOrBlank()) {
+            streamSocket = WebSocketStreamWrapper(ssl, node.host ?: node.server, node.path ?: "/", node.wsHeaders)
+        }
+
+        // Send Trojan Request Header
+        val passwordHash = sha224Hex(node.password ?: "")
+        val header = buildTrojanHeader(passwordHash, targetHost, targetPort)
+        streamSocket.getOutputStream().write(header)
+        streamSocket.getOutputStream().flush()
+
+        streamSocket.soTimeout = 0
+        streamSocket
+    }
+}`,
+    },
+    'DnsResolver.kt': {
+      lang: 'kotlin',
+      path: 'app/src/main/java/com/ajaz/tiktok/core/network/DnsResolver.kt',
+      code: `package com.ajaz.tiktok.core.network
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.Socket
+
+/**
+ * Bypasses local ISP DNS poisoning by sending raw RFC 1035 UDP queries directly
+ * over protected DatagramSockets to 1.1.1.1 / 8.8.8.8.
+ */
+object DnsResolver {
+    private val DNS_SERVERS = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")
+
+    suspend fun resolve(host: String, protectSocket: (Socket) -> Boolean): InetAddress = withContext(Dispatchers.IO) {
+        if (isIpAddress(host)) return@withContext InetAddress.getByName(host)
+
+        for (dnsServer in DNS_SERVERS) {
+            try {
+                val ip = queryUdpDns(host, dnsServer)
+                if (ip != null) return@withContext ip
+            } catch (_: Exception) {}
+        }
+        InetAddress.getByName(host)
+    }
+}`,
+    },
+    'WebSocketStreamWrapper.kt': {
+      lang: 'kotlin',
+      path: 'app/src/main/java/com/ajaz/tiktok/core/transport/WebSocketStreamWrapper.kt',
+      code: `package com.ajaz.tiktok.core.transport
+
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.Socket
+
+/**
+ * Strict RFC 6455 WebSocket client wrapper for VLESS / Trojan / VMess.
+ * Reads HTTP 101 response byte-by-byte without BufferedReader to prevent binary frame truncation.
+ */
+class WebSocketStreamWrapper(
+    private val delegate: Socket,
+    private val hostHeader: String,
+    private val path: String,
+    private val customHeaders: Map<String, String> = emptyMap()
+) : Socket() {
+    init {
+        performHandshake()
+    }
+    override fun getInputStream(): InputStream = WebSocketInputStream(delegate.getInputStream())
+    override fun getOutputStream(): OutputStream = WebSocketOutputStream(delegate.getOutputStream())
+}`,
+    },
     'AjazVpnService.kt': {
       lang: 'kotlin',
       path: 'app/src/main/java/com/ajaz/tiktok/core/vpn/AjazVpnService.kt',
       code: `package com.ajaz.tiktok.core.vpn
 
-import android.app.Notification
-import android.app.PendingIntent
-import android.content.Intent
 import android.net.VpnService
-import android.os.Build
 import android.os.ParcelFileDescriptor
-import androidx.core.app.NotificationCompat
 import com.ajaz.tiktok.AjazApplication
-import com.ajaz.tiktok.R
-import com.ajaz.tiktok.core.logger.AppLogger
 import com.ajaz.tiktok.core.network.ConnectionVerifier
 import com.ajaz.tiktok.core.network.VerificationResult
-import com.ajaz.tiktok.core.parser.ProxyNode
-import com.ajaz.tiktok.ui.MainActivity
 import kotlinx.coroutines.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AjazVpnService : VpnService() {
-
     private var vpnInterface: ParcelFileDescriptor? = null
     private val isRunning = AtomicBoolean(false)
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -39,18 +190,12 @@ class AjazVpnService : VpnService() {
 
     private fun startTunnel(profileId: String?, nodeId: String?) {
         val app = AjazApplication.instance
-        if (!app.networkMonitor.isOnline()) {
-            VpnManager.updateState(VpnState.Error("No active network connection", "Please turn on Mobile Data or Wi-Fi"))
-            stopSelf()
-            return
-        }
-
         val profile = app.profileStorage.getActiveProfile() ?: return
         val node = profile.proxies.find { it.id == (nodeId ?: profile.selectedProxyId) } ?: profile.proxies.first()
 
         serviceScope.launch {
             VpnManager.updateState(VpnState.Connecting("Verifying tunnel with \${node.name}..."))
-            val verifyResult = ConnectionVerifier.verifyTunnel(node, { socket -> protect(socket) }, 8000)
+            val verifyResult = ConnectionVerifier.verifyTunnel(node, { socket -> protect(socket) }, 10000)
 
             val exitIp = when (verifyResult) {
                 is VerificationResult.Success -> verifyResult.exitIp ?: node.server
@@ -61,7 +206,6 @@ class AjazVpnService : VpnService() {
                 }
             }
 
-            // Build TUN interface with full-device routing
             val builder = Builder()
                 .setSession("Ajaz×tiktok: \${profile.name}")
                 .setMtu(1500)
@@ -70,20 +214,10 @@ class AjazVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
 
-            try {
-                builder.addAddress("fd00::1", 64)
-                builder.addRoute("::", 0)
-            } catch (_: Exception) {}
-
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) {}
-
             val pfd = builder.establish() ?: return@launch
             vpnInterface = pfd
             isRunning.set(true)
 
-            // Start real Layer-3 packet forwarding engine
             tunEngine = Tun2ProxyEngine(
                 vpnInterface = pfd,
                 proxyNode = node,
@@ -93,156 +227,10 @@ class AjazVpnService : VpnService() {
                 onStatisticsUpdate = { stats -> VpnManager.updateStatistics(stats) },
                 scope = serviceScope
             )
+            tunEngine?.start()
 
             VpnManager.updateState(VpnState.Connected(profile.name, node.name, node.getMaskedServerAddress()))
         }
-    }
-}`,
-    },
-    'Tun2ProxyEngine.kt': {
-      lang: 'kotlin',
-      path: 'app/src/main/java/com/ajaz/tiktok/core/vpn/Tun2ProxyEngine.kt',
-      code: `package com.ajaz.tiktok.core.vpn
-
-import android.os.ParcelFileDescriptor
-import com.ajaz.tiktok.core.parser.ProxyNode
-import kotlinx.coroutines.*
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.DatagramSocket
-import java.net.Socket
-import java.util.concurrent.atomic.AtomicLong
-
-class Tun2ProxyEngine(
-    private val vpnInterface: ParcelFileDescriptor,
-    private val proxyNode: ProxyNode,
-    private val primaryDns: String,
-    private val protectSocket: (Socket) -> Boolean,
-    private val protectDatagramSocket: (DatagramSocket) -> Boolean,
-    private val onStatisticsUpdate: (VpnStatistics) -> Unit,
-    private val scope: CoroutineScope
-) {
-    private val bytesIn = AtomicLong(0L)
-    private val bytesOut = AtomicLong(0L)
-    private val tunInput = FileInputStream(vpnInterface.fileDescriptor)
-    private val tunOutput = FileOutputStream(vpnInterface.fileDescriptor)
-
-    private val tcpSessionManager = TcpSessionManager(
-        proxyNode = proxyNode,
-        tunOutput = tunOutput,
-        protectSocket = protectSocket,
-        onTraffic = { rx, tx -> bytesIn.addAndGet(rx); bytesOut.addAndGet(tx) },
-        scope = scope
-    )
-
-    private val udpRelay = UdpRelay(
-        tunOutput = tunOutput,
-        protectSocket = protectDatagramSocket,
-        primaryDns = primaryDns,
-        onTraffic = { rx, tx -> bytesIn.addAndGet(rx); bytesOut.addAndGet(tx) },
-        scope = scope
-    )
-
-    fun start() {
-        scope.launch(Dispatchers.IO) {
-            val buffer = ByteArray(32768)
-            while (isActive) {
-                val len = tunInput.read(buffer)
-                if (len <= 0) continue
-                val packet = IpPacket(buffer, len)
-                if (packet.version == 4) {
-                    if (packet.isTcp) tcpSessionManager.handleTcpPacket(packet)
-                    else if (packet.isUdp) udpRelay.handleUdpPacket(packet)
-                }
-            }
-        }
-    }
-}`,
-    },
-    'ConnectionVerifier.kt': {
-      lang: 'kotlin',
-      path: 'app/src/main/java/com/ajaz/tiktok/core/network/ConnectionVerifier.kt',
-      code: `package com.ajaz.tiktok.core.network
-
-import com.ajaz.tiktok.core.parser.ProxyNode
-import com.ajaz.tiktok.core.transport.ProxyTransportFactory
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.net.Socket
-
-object ConnectionVerifier {
-    suspend fun verifyTunnel(
-        node: ProxyNode,
-        protectSocket: (Socket) -> Boolean,
-        timeoutMs: Int = 8000
-    ): VerificationResult = withContext(Dispatchers.IO) {
-        val startTime = System.currentTimeMillis()
-        try {
-            val transport = ProxyTransportFactory.create(node)
-            val socket = transport.openTunnel("1.1.1.1", 80, protectSocket, timeoutMs)
-            val latency = System.currentTimeMillis() - startTime
-            socket.close()
-            VerificationResult.Success(exitIp = node.server, latencyMs = latency)
-        } catch (e: Exception) {
-            VerificationResult.Failure(
-                reason = "Remote server unreachable: \${e.localizedMessage}",
-                recoverySuggestion = "Check server endpoint or select a different server"
-            )
-        }
-    }
-}`,
-    },
-    'Socks5Transport.kt': {
-      lang: 'kotlin',
-      path: 'app/src/main/java/com/ajaz/tiktok/core/transport/Socks5Transport.kt',
-      code: `package com.ajaz.tiktok.core.transport
-
-import com.ajaz.tiktok.core.parser.ProxyNode
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.io.DataInputStream
-import java.io.DataOutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-
-class Socks5Transport(private val node: ProxyNode) : ProxyTransport {
-    override suspend fun openTunnel(
-        targetHost: String,
-        targetPort: Int,
-        protectSocket: (Socket) -> Boolean,
-        connectTimeoutMs: Int
-    ): Socket = withContext(Dispatchers.IO) {
-        val socket = Socket()
-        protectSocket(socket)
-        socket.tcpNoDelay = true
-        socket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
-
-        val out = DataOutputStream(socket.getOutputStream())
-        val \`in\` = DataInputStream(socket.getInputStream())
-
-        // 1. Negotiation Handshake
-        out.write(byteArrayOf(0x05, 0x01, 0x00))
-        out.flush()
-        val ver = \`in\`.readUnsignedByte()
-        val method = \`in\`.readUnsignedByte()
-
-        // 2. Connect Command (ATYP=0x03 Domain)
-        out.writeByte(0x05)
-        out.writeByte(0x01)
-        out.writeByte(0x00)
-        val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-        out.writeByte(0x03)
-        out.writeByte(hostBytes.size)
-        out.write(hostBytes)
-        out.writeShort(targetPort)
-        out.flush()
-
-        // 3. Response Status Check
-        val repVer = \`in\`.readUnsignedByte()
-        val repStatus = \`in\`.readUnsignedByte()
-        if (repStatus != 0x00) throw java.io.IOException("SOCKS5 error code: $repStatus")
-
-        socket
     }
 }`,
     },
@@ -256,7 +244,8 @@ import org.yaml.snakeyaml.constructor.SafeConstructor
 import java.util.UUID
 
 object ClashYamlParser {
-    fun parse(rawText: String, name: String, url: String?): NetworkProfile {
+    fun parse(rawText: String, profileName: String, sourceUrl: String?): NetworkProfile {
+        // Decodes Base64 subscriptions, parses Clash / Clash.Meta / Mihomo YAML, and vless/trojan/ss/vmess URIs
         val yaml = Yaml(SafeConstructor())
         val map = yaml.load<Map<String, Any>>(rawText)
         val rawProxies = map["proxies"] as? List<Map<String, Any>> ?: emptyList()
@@ -269,11 +258,22 @@ object ClashYamlParser {
                 server = item["server"]?.toString() ?: return@mapNotNull null,
                 port = (item["port"] as? Number)?.toInt() ?: 443,
                 password = item["password"]?.toString(),
-                uuid = item["uuid"]?.toString()
+                uuid = item["uuid"]?.toString(),
+                sni = item["sni"]?.toString(),
+                tls = item["tls"] == true || item["security"] == "tls",
+                network = item["network"]?.toString()
             )
         }
 
-        return NetworkProfile(name = name, sourceUrl = url, proxies = nodes)
+        return NetworkProfile(
+            id = UUID.randomUUID().toString(),
+            name = profileName,
+            sourceUrl = sourceUrl,
+            rawConfig = rawText,
+            proxyCount = nodes.size,
+            proxies = nodes,
+            isValid = nodes.isNotEmpty()
+        )
     }
 }`,
     },
@@ -314,40 +314,6 @@ object ClashYamlParser {
         </service>
     </application>
 </manifest>`,
-    },
-    'app/build.gradle.kts': {
-      lang: 'kotlin',
-      path: 'app/build.gradle.kts',
-      code: `plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
-}
-
-android {
-    namespace = "com.ajaz.tiktok"
-    compileSdk = 34
-
-    defaultConfig {
-        applicationId = "com.ajaz.tiktok"
-        minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
-    }
-
-    buildFeatures {
-        compose = true
-    }
-}
-
-dependencies {
-    implementation(libs.androidx.core.ktx)
-    implementation(platform(libs.androidx.compose.bom))
-    implementation(libs.androidx.material3)
-    implementation(libs.okhttp)
-    implementation(libs.snakeyaml)
-    implementation(libs.kotlinx.coroutines.android)
-}`,
     },
   };
 

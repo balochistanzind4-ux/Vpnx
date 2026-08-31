@@ -7,15 +7,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
-import java.io.EOFException
-import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.Mac
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLParameters
@@ -25,16 +27,15 @@ import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
 /**
- * Production-grade VLESS Protocol Transport implementation.
- * Supports:
- * - Direct TCP and WebSocket (WS) transport layers
- * - Standard TLS and Reality TLS with SNI & ALPN negotiation
- * - IPv4, IPv6, and Remote Domain Name addressing
- * - Hyphenated and non-hyphenated UUID formats
- * - Resilient DNS bootstrap & resolution
- * - Automatic stripping of VLESS server response header (v0 addons)
+ * Production VMess Transport implementation.
+ * Features:
+ * - VMess HMAC-MD5 Auth Header generation
+ * - AES-128-CFB Body Encryption
+ * - TLS SNI and ALPN negotiation
+ * - WebSocket and plain TCP transport modes
+ * - Direct DNS fallback via DnsResolver
  */
-class VlessTransport(private val node: ProxyNode) : ProxyTransport {
+class VmessTransport(private val node: ProxyNode) : ProxyTransport {
 
     override suspend fun openTunnel(
         targetHost: String,
@@ -45,24 +46,24 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
         val rawSocket = Socket()
         val protected = protectSocket(rawSocket)
         if (!protected) {
-            AppLogger.w("VLESS", "Warning: protectSocket() returned false for raw socket")
+            AppLogger.w("VMess", "Warning: protectSocket() returned false")
         }
 
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = Math.max(connectTimeoutMs + 5000, 15000)
 
-        // 1. Resolve proxy server IP via DnsResolver
+        // Resolve Server IP
         val serverIp = DnsResolver.resolve(node.server, protectSocket)
-        AppLogger.d("VLESS", "Connecting to ${node.name} (${serverIp.hostAddress}:${node.port})...")
+        AppLogger.d("VMess", "Connecting to ${node.name} (${serverIp.hostAddress}:${node.port})...")
         rawSocket.connect(InetSocketAddress(serverIp, node.port), connectTimeoutMs)
 
         var streamSocket: Socket = rawSocket
 
-        // 2. TLS / Reality Layer
-        val isTls = node.tls || node.realityPublicKey != null || node.port == 443
+        // TLS Layer
+        val isTls = node.tls || node.port == 443
         if (isTls) {
             val sni = (node.sni ?: node.host ?: node.server).trim()
-            val sslFactory: SSLSocketFactory = if (node.skipCertVerify || node.realityPublicKey != null) {
+            val sslFactory: SSLSocketFactory = if (node.skipCertVerify) {
                 createInsecureSslSocketFactory()
             } else {
                 try {
@@ -84,7 +85,7 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
                     sslParams.applicationProtocols = alpn.toTypedArray()
                 }
             } catch (e: Exception) {
-                AppLogger.w("VLESS", "Failed to configure TLS SNI/ALPN: ${e.message}")
+                AppLogger.w("VMess", "Failed to set TLS SNI/ALPN: ${e.message}")
             }
 
             sslSocket.sslParameters = sslParams
@@ -92,7 +93,7 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
             streamSocket = sslSocket
         }
 
-        // 3. WebSocket Layer
+        // WebSocket Layer
         val isWs = node.network.equals("ws", ignoreCase = true) || !node.path.isNullOrBlank()
         if (isWs) {
             val hostHeader = (node.host ?: node.sni ?: node.server).trim()
@@ -105,60 +106,112 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
             )
         }
 
-        // 4. Send VLESS Request Header
+        // Send VMess Request Header
         val uuidBytes = parseUuidToBytes(node.uuid ?: "")
-        val headerBytes = buildVlessHeader(uuidBytes, targetHost, targetPort)
+        val headerBytes = buildVmessHeader(uuidBytes, targetHost, targetPort)
 
         val out = streamSocket.getOutputStream()
         out.write(headerBytes)
         out.flush()
 
-        // 5. Wrap stream to strip VLESS response header (version + addon length)
-        val wrappedSocket = VlessSocketWrapper(streamSocket)
-        wrappedSocket.setSoTimeout(0) // Reset timeout for active session
-        return@withContext wrappedSocket
+        streamSocket.soTimeout = 0
+        return@withContext streamSocket
     }
 
-    private fun buildVlessHeader(uuidBytes: ByteArray, targetHost: String, targetPort: Int): ByteArray {
-        val baos = ByteArrayOutputStream()
-        val dos = DataOutputStream(baos)
+    private fun buildVmessHeader(userUuid: ByteArray, targetHost: String, targetPort: Int): ByteArray {
+        val random = SecureRandom()
 
-        // Version: 0x00
-        dos.writeByte(0x00)
+        // 1. Generate 16 bytes auth ID via HMAC-MD5(UUID, UTC timestamp)
+        val timestamp = (System.currentTimeMillis() / 1000L)
+        val timeBytes = ByteArray(8)
+        for (i in 0 until 8) {
+            timeBytes[7 - i] = ((timestamp shr (i * 8)) and 0xFF).toByte()
+        }
 
-        // 16-byte UUID
-        dos.write(uuidBytes)
+        val mac = Mac.getInstance("HmacMD5")
+        mac.init(SecretKeySpec(userUuid, "HmacMD5"))
+        val authId = mac.doFinal(timeBytes)
 
-        // Addons length: 0x00 (no addons)
-        dos.writeByte(0x00)
+        // 2. Request Command & Destination Body
+        val bodyBaos = ByteArrayOutputStream()
+        val dos = DataOutputStream(bodyBaos)
 
-        // Command: 0x01 (TCP Connect)
-        dos.writeByte(0x01)
+        dos.writeByte(0x01) // Version 1
+        val reqIv = ByteArray(16).apply { random.nextBytes(this) }
+        val reqKey = ByteArray(16).apply { random.nextBytes(this) }
+        dos.write(reqIv)
+        dos.write(reqKey)
 
-        // Port (2 bytes Big Endian)
+        dos.writeByte(0x01) // Response Auth (V)
+        dos.writeByte(0x01) // Options: S = 1 (Standard)
+        dos.writeByte(0x00) // Padding / P
+        dos.writeByte(0x00) // Security: AES-128-CFB
+
+        dos.writeByte(0x00) // Reserved
+        dos.writeByte(0x01) // Command: 0x01 (TCP)
         dos.writeShort(targetPort)
 
-        // Address Type: IPv4 (0x01), Domain (0x02), IPv6 (0x03)
+        // Address Type: 0x01 (IPv4), 0x02 (Domain), 0x03 (IPv6)
         val isIpv4 = targetHost.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"""))
         val isIpv6 = targetHost.contains(":") && !targetHost.contains(".")
 
         if (isIpv4) {
             dos.writeByte(0x01)
-            val ip = InetAddress.getByName(targetHost).address
-            dos.write(ip)
+            dos.write(InetAddress.getByName(targetHost).address)
         } else if (isIpv6) {
             dos.writeByte(0x03)
-            val ip = InetAddress.getByName(targetHost).address
-            dos.write(ip)
+            dos.write(InetAddress.getByName(targetHost).address)
         } else {
-            // Domain Name (0x02) - 1 byte length + ASCII bytes
             dos.writeByte(0x02)
             val domainBytes = targetHost.toByteArray(Charsets.US_ASCII)
             dos.writeByte(domainBytes.size)
             dos.write(domainBytes)
         }
 
-        return baos.toByteArray()
+        // Random Padding (0..16 bytes)
+        val padLen = random.nextInt(16)
+        val padding = ByteArray(padLen).apply { random.nextBytes(this) }
+        dos.write(padding)
+
+        // Checksum (FNV-1a)
+        val rawBody = bodyBaos.toByteArray()
+        val checksum = fnv1a(rawBody)
+
+        val fullBody = ByteArrayOutputStream()
+        fullBody.write(rawBody)
+        fullBody.write(((checksum shr 24) and 0xFF).toInt())
+        fullBody.write(((checksum shr 16) and 0xFF).toInt())
+        fullBody.write(((checksum shr 8) and 0xFF).toInt())
+        fullBody.write((checksum and 0xFF).toInt())
+
+        // 3. Encrypt Body with AES-128-CFB using MD5(UUID + "c48619fe-8f02-49e0-b9e9-edf763e17e21")
+        val md = MessageDigest.getInstance("MD5")
+        md.update(userUuid)
+        md.update("c48619fe-8f02-49e0-b9e9-edf763e17e21".toByteArray(Charsets.US_ASCII))
+        val bodyKey = md.digest()
+
+        val mdIv = MessageDigest.getInstance("MD5")
+        mdIv.update(timeBytes)
+        val bodyIv = mdIv.digest()
+
+        val cipher = Cipher.getInstance("AES/CFB/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(bodyKey, "AES"), IvParameterSpec(bodyIv))
+        val encryptedBody = cipher.doFinal(fullBody.toByteArray())
+
+        // Assemble Auth ID + Encrypted Body
+        val result = ByteArrayOutputStream()
+        result.write(authId)
+        result.write(encryptedBody)
+        return result.toByteArray()
+    }
+
+    private fun fnv1a(data: ByteArray): Int {
+        var hash = 0x811c9dc5.toInt()
+        for (b in data) {
+            hash = hash xor (b.toInt() and 0xFF)
+            hash *= 0x01000193
+        }
+        return hash
     }
 
     private fun parseUuidToBytes(uuidStr: String): ByteArray {
@@ -208,64 +261,7 @@ class VlessTransport(private val node: ProxyNode) : ProxyTransport {
             socket.close()
             Pair(true, null)
         } catch (e: Exception) {
-            Pair(false, e.localizedMessage ?: "VLESS connection failed")
+            Pair(false, e.localizedMessage ?: "VMess connection failed")
         }
     }
-}
-
-/**
- * Strips the VLESS response header (version byte + addon length + addon bytes) on first read.
- */
-class VlessSocketWrapper(private val delegate: Socket) : Socket() {
-    private val vlessIn = VlessInputStream(delegate.getInputStream())
-
-    override fun getInputStream(): InputStream = vlessIn
-    override fun getOutputStream(): OutputStream = delegate.getOutputStream()
-    override fun close() = delegate.close()
-    override fun isClosed(): Boolean = delegate.isClosed
-    override fun isConnected(): Boolean = delegate.isConnected
-    override fun setSoTimeout(timeout: Int) {
-        delegate.soTimeout = timeout
-    }
-    override fun setTcpNoDelay(on: Boolean) {
-        delegate.tcpNoDelay = on
-    }
-}
-
-class VlessInputStream(private val rawIn: InputStream) : InputStream() {
-    private var headerParsed = false
-
-    override fun read(): Int {
-        val single = ByteArray(1)
-        val read = read(single, 0, 1)
-        return if (read == -1) -1 else (single[0].toInt() and 0xFF)
-    }
-
-    override fun read(b: ByteArray, off: Int, len: Int): Int {
-        if (!headerParsed) {
-            parseResponseHeader()
-        }
-        return rawIn.read(b, off, len)
-    }
-
-    private fun parseResponseHeader() {
-        val version = rawIn.read()
-        if (version == -1) throw EOFException("VLESS server closed connection before sending response header")
-
-        val addonLen = rawIn.read()
-        if (addonLen == -1) throw EOFException("VLESS server response truncated at addon length")
-
-        if (addonLen > 0) {
-            var read = 0
-            val addonBuf = ByteArray(addonLen)
-            while (read < addonLen) {
-                val r = rawIn.read(addonBuf, read, addonLen - read)
-                if (r == -1) throw EOFException("VLESS response addons truncated")
-                read += r
-            }
-        }
-        headerParsed = true
-    }
-
-    override fun close() = rawIn.close()
 }

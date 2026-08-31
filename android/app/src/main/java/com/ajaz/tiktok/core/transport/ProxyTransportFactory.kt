@@ -12,15 +12,20 @@ object ProxyTransportFactory {
             ProxyType.SHADOWSOCKS -> ShadowsocksTransport(node)
             ProxyType.TROJAN -> TrojanTransport(node)
             ProxyType.VLESS -> VlessTransport(node)
+            ProxyType.VMESS -> VmessTransport(node)
+            ProxyType.HYSTERIA2 -> Hysteria2Transport(node)
+            ProxyType.WIREGUARD -> WireguardTransport(node)
             ProxyType.DIRECT -> DirectTransport()
-            ProxyType.VMESS, ProxyType.HYSTERIA2, ProxyType.WIREGUARD -> {
-                throw UnsupportedOperationException("Protocol '${node.type.displayName}' is not supported natively in this build. Supported protocols: VLESS, Trojan, Shadowsocks, SOCKS5, HTTP, Direct.")
-            }
             ProxyType.REJECT -> {
-                throw IllegalArgumentException("Connection rejected by configuration: '${node.name}'")
+                throw IllegalArgumentException("Connection rejected by configuration rule: '${node.name}'")
             }
             ProxyType.UNKNOWN -> {
-                throw IllegalArgumentException("Unsupported proxy protocol: '${node.type.displayName}'. Please select a supported node (VLESS, Trojan, Shadowsocks, SOCKS5, HTTP).")
+                // Fallback to SOCKS5/HTTP or VLESS based on port/fields
+                if (!node.uuid.isNullOrBlank() || node.tls || node.port == 443) {
+                    VlessTransport(node)
+                } else {
+                    Socks5Transport(node)
+                }
             }
         }
     }

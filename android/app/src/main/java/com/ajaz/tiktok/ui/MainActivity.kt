@@ -133,9 +133,8 @@ fun MainAppContent(
                     .border(
                         width = 1.dp,
                         brush = Brush.verticalGradient(
-                            colors = listOf(CardBorderLight.copy(alpha = 0.6f), Color.Transparent)
-                        ),
-                        shape = RoundedCornerShape(12.dp)
+                            listOf(CardBorderLight.copy(alpha = 0.6f), Color.Transparent)
+                        )
                     )
             ) {
                 NavigationBar(

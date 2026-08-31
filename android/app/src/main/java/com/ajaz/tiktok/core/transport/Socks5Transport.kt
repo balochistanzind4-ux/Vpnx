@@ -1,6 +1,7 @@
 package com.ajaz.tiktok.core.transport
 
 import com.ajaz.tiktok.core.logger.AppLogger
+import com.ajaz.tiktok.core.network.DnsResolver
 import com.ajaz.tiktok.core.parser.ProxyNode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,8 +27,12 @@ class Socks5Transport(private val node: ProxyNode) : ProxyTransport {
         }
 
         socket.tcpNoDelay = true
-        socket.soTimeout = 30000
-        socket.connect(InetSocketAddress(node.server, node.port), connectTimeoutMs)
+        socket.soTimeout = Math.max(connectTimeoutMs + 5000, 15000)
+
+        // Resolve server IP via DnsResolver
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        AppLogger.d("Socks5", "Connecting to ${node.name} (${serverIp.hostAddress}:${node.port})...")
+        socket.connect(InetSocketAddress(serverIp, node.port), connectTimeoutMs)
 
         val out = DataOutputStream(socket.getOutputStream())
         val `in` = DataInputStream(socket.getInputStream())
@@ -35,10 +40,10 @@ class Socks5Transport(private val node: ProxyNode) : ProxyTransport {
         // 1. Negotiation Handshake
         val hasAuth = !node.password.isNullOrBlank() || !node.uuid.isNullOrBlank()
         if (hasAuth) {
-            // SOCKS5 (0x05), 2 methods, NO_AUTH (0x00) and USER_PASS (0x02)
+            // SOCKS5 (0x05), 2 methods: NO_AUTH (0x00) and USER_PASS (0x02)
             out.write(byteArrayOf(0x05, 0x02, 0x00, 0x02))
         } else {
-            // SOCKS5 (0x05), 1 method, NO_AUTH (0x00)
+            // SOCKS5 (0x05), 1 method: NO_AUTH (0x00)
             out.write(byteArrayOf(0x05, 0x01, 0x00))
         }
         out.flush()
@@ -77,24 +82,25 @@ class Socks5Transport(private val node: ProxyNode) : ProxyTransport {
         }
 
         // 3. Connect Command
-        // SOCKS5 (0x05), CONNECT (0x01), RSV (0x00)
         out.writeByte(0x05)
-        out.writeByte(0x01)
-        out.writeByte(0x00)
+        out.writeByte(0x01) // CONNECT
+        out.writeByte(0x00) // RSV
 
-        // Address Type: IPv4 (0x01), Domain (0x03), IPv6 (0x04)
-        val ip = try {
-            InetAddress.getByName(targetHost)
-        } catch (_: Exception) {
-            null
-        }
+        val isIpv4 = targetHost.matches(Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"""))
+        val isIpv6 = targetHost.contains(":") && !targetHost.contains(".")
 
-        if (ip != null && ip.address.size == 4) {
+        if (isIpv4) {
+            val ipBytes = InetAddress.getByName(targetHost).address
             out.writeByte(0x01) // IPv4
-            out.write(ip.address)
+            out.write(ipBytes)
+        } else if (isIpv6) {
+            val ipBytes = InetAddress.getByName(targetHost).address
+            out.writeByte(0x04) // IPv6
+            out.write(ipBytes)
         } else {
+            // Domain name
             val hostBytes = targetHost.toByteArray(Charsets.UTF_8)
-            out.writeByte(0x03) // Domain name
+            out.writeByte(0x03)
             out.writeByte(hostBytes.size)
             out.write(hostBytes)
         }
@@ -142,7 +148,7 @@ class Socks5Transport(private val node: ProxyNode) : ProxyTransport {
         }
         val boundPort = `in`.readUnsignedShort()
 
-        // Tunnel is established! Reset soTimeout for active session
+        // Reset soTimeout for active session
         socket.soTimeout = 0
         return@withContext socket
     }

@@ -698,18 +698,227 @@ object ProxyTransportFactory {
             ProxyType.HTTP -> HttpConnectTransport(node)
             ProxyType.SHADOWSOCKS -> ShadowsocksTransport(node)
             ProxyType.TROJAN -> TrojanTransport(node)
+            ProxyType.VLESS -> VlessTransport(node)
+            ProxyType.VMESS -> VmessTransport(node)
+            ProxyType.HYSTERIA2 -> Hysteria2Transport(node)
+            ProxyType.WIREGUARD -> WireguardTransport(node)
             ProxyType.DIRECT -> DirectTransport()
-            ProxyType.VMESS, ProxyType.VLESS, ProxyType.HYSTERIA2, ProxyType.WIREGUARD -> {
-                // Return SOCKS5 or HTTP transport fallback if specified in config, otherwise dedicated handler
-                Socks5Transport(node)
-            }
             ProxyType.REJECT -> {
                 throw IllegalArgumentException("Connection rejected by configuration: '\${node.name}'")
             }
             ProxyType.UNKNOWN -> {
-                throw IllegalArgumentException("Unsupported proxy protocol: '\${node.type.displayName}'. Please choose a supported provider.")
+                if (!node.uuid.isNullOrBlank() || node.tls || node.port == 443) {
+                    VlessTransport(node)
+                } else {
+                    Socks5Transport(node)
+                }
             }
         }
+    }
+}
+`
+  );
+
+  zip.file(
+    'app/src/main/java/com/ajaz/tiktok/core/network/DnsResolver.kt',
+    `package com.ajaz.tiktok.core.network
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.Socket
+
+object DnsResolver {
+    private val DNS_SERVERS = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")
+
+    suspend fun resolve(host: String, protectSocket: (Socket) -> Boolean): InetAddress = withContext(Dispatchers.IO) {
+        if (isIp(host)) return@withContext InetAddress.getByName(host)
+        for (dns in DNS_SERVERS) {
+            try {
+                val ip = query(host, dns)
+                if (ip != null) return@withContext ip
+            } catch (_: Exception) {}
+        }
+        InetAddress.getByName(host)
+    }
+
+    private fun isIp(s: String) = s.matches(Regex("""^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$""")) || s.contains(":")
+    private fun query(host: String, dns: String): InetAddress? {
+        val socket = DatagramSocket().apply { soTimeout = 3000 }
+        try {
+            val q = buildQuery(host)
+            socket.send(DatagramPacket(q, q.size, InetAddress.getByName(dns), 53))
+            val buf = ByteArray(512)
+            val p = DatagramPacket(buf, buf.size)
+            socket.receive(p)
+            return parseResponse(buf, p.length)
+        } finally {
+            socket.close()
+        }
+    }
+
+    private fun buildQuery(host: String): ByteArray {
+        val baos = java.io.ByteArrayOutputStream()
+        val dos = java.io.DataOutputStream(baos)
+        dos.writeShort((1..65535).random())
+        dos.writeShort(0x0100)
+        dos.writeShort(1)
+        dos.writeShort(0)
+        dos.writeShort(0)
+        dos.writeShort(0)
+        for (label in host.split(".")) {
+            val bytes = label.toByteArray(Charsets.US_ASCII)
+            dos.writeByte(bytes.size)
+            dos.write(bytes)
+        }
+        dos.writeByte(0)
+        dos.writeShort(1)
+        dos.writeShort(1)
+        return baos.toByteArray()
+    }
+
+    private fun parseResponse(buf: ByteArray, len: Int): InetAddress? {
+        var idx = 12
+        while (idx < len && buf[idx].toInt() != 0) {
+            idx += (buf[idx].toInt() and 0xFF) + 1
+        }
+        idx += 5
+        while (idx + 10 <= len) {
+            if ((buf[idx].toInt() and 0xC0) == 0xC0) idx += 2 else {
+                while (idx < len && buf[idx].toInt() != 0) idx += (buf[idx].toInt() and 0xFF) + 1
+                idx += 1
+            }
+            val type = ((buf[idx].toInt() and 0xFF) shl 8) or (buf[idx + 1].toInt() and 0xFF)
+            val dataLen = ((buf[idx + 8].toInt() and 0xFF) shl 8) or (buf[idx + 9].toInt() and 0xFF)
+            idx += 10
+            if (type == 1 && dataLen == 4 && idx + 4 <= len) {
+                val ip = ByteArray(4)
+                System.arraycopy(buf, idx, ip, 0, 4)
+                return InetAddress.getByAddress(ip)
+            }
+            idx += dataLen
+        }
+        return null
+    }
+}
+`
+  );
+
+  zip.file(
+    'app/src/main/java/com/ajaz/tiktok/core/transport/VlessTransport.kt',
+    `package com.ajaz.tiktok.core.transport
+
+import com.ajaz.tiktok.core.network.DnsResolver
+import com.ajaz.tiktok.core.parser.ProxyNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
+import javax.net.ssl.SSLSocket
+
+class VlessTransport(private val node: ProxyNode) : ProxyTransport {
+    override suspend fun openTunnel(targetHost: String, targetPort: Int, protectSocket: (Socket) -> Boolean, connectTimeoutMs: Int): Socket = withContext(Dispatchers.IO) {
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        val rawSocket = Socket()
+        protectSocket(rawSocket)
+        rawSocket.connect(InetSocketAddress(serverIp, node.port), connectTimeoutMs)
+        var streamSocket: Socket = rawSocket
+
+        if (node.tls || node.port == 443) {
+            val sslFactory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            val sni = node.sni ?: node.host ?: node.server
+            val ssl = sslFactory.createSocket(streamSocket, sni, node.port, true) as SSLSocket
+            ssl.startHandshake()
+            streamSocket = ssl
+        }
+
+        if (node.network.equals("ws", true) || !node.path.isNullOrBlank()) {
+            streamSocket = WebSocketStreamWrapper(streamSocket, node.host ?: node.server, node.path ?: "/", node.wsHeaders)
+        }
+
+        val out = streamSocket.getOutputStream()
+        out.write(byteArrayOf(0x00)) // Version 0
+        val uuidClean = (node.uuid ?: "").replace("-", "")
+        val uuidBytes = ByteArray(16)
+        for (i in 0 until 16) {
+            if (i * 2 + 2 <= uuidClean.length) {
+                uuidBytes[i] = uuidClean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        }
+        out.write(uuidBytes)
+        out.write(byteArrayOf(0x00, 0x01)) // Addons length = 0, Command = TCP
+        out.write(byteArrayOf(((targetPort shr 8) and 0xFF).toByte(), (targetPort and 0xFF).toByte()))
+        out.write(byteArrayOf(0x02, targetHost.length.toByte()))
+        out.write(targetHost.toByteArray(Charsets.US_ASCII))
+        out.flush()
+
+        // Read and discard VLESS server response header (Version + Addons)
+        val \`in\` = streamSocket.getInputStream()
+        val resVer = \`in\`.read()
+        val addonLen = \`in\`.read()
+        if (addonLen > 0) {
+            val skipBuf = ByteArray(addonLen)
+            var read = 0
+            while (read < addonLen) {
+                val r = \`in\`.read(skipBuf, read, addonLen - read)
+                if (r == -1) break
+                read += r
+            }
+        }
+
+        streamSocket.soTimeout = 0
+        streamSocket
+    }
+}
+`
+  );
+
+  zip.file(
+    'app/src/main/java/com/ajaz/tiktok/core/transport/TrojanTransport.kt',
+    `package com.ajaz.tiktok.core.transport
+
+import com.ajaz.tiktok.core.network.DnsResolver
+import com.ajaz.tiktok.core.parser.ProxyNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.security.MessageDigest
+import javax.net.ssl.SSLSocket
+
+class TrojanTransport(private val node: ProxyNode) : ProxyTransport {
+    override suspend fun openTunnel(targetHost: String, targetPort: Int, protectSocket: (Socket) -> Boolean, connectTimeoutMs: Int): Socket = withContext(Dispatchers.IO) {
+        val serverIp = DnsResolver.resolve(node.server, protectSocket)
+        val rawSocket = Socket()
+        protectSocket(rawSocket)
+        rawSocket.connect(InetSocketAddress(serverIp, node.port), connectTimeoutMs)
+
+        val sslFactory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+        val sni = node.sni ?: node.host ?: node.server
+        val ssl = sslFactory.createSocket(rawSocket, sni, node.port, true) as SSLSocket
+        ssl.startHandshake()
+        var streamSocket: Socket = ssl
+
+        if (node.network.equals("ws", true) || !node.path.isNullOrBlank()) {
+            streamSocket = WebSocketStreamWrapper(ssl, node.host ?: node.server, node.path ?: "/", node.wsHeaders)
+        }
+
+        val md = MessageDigest.getInstance("SHA-224")
+        val hash = md.digest((node.password ?: "").toByteArray(Charsets.UTF_8))
+        val hex = hash.joinToString("") { "%02x".format(it) }
+
+        val out = streamSocket.getOutputStream()
+        out.write(hex.toByteArray(Charsets.US_ASCII))
+        out.write(byteArrayOf(0x0D, 0x0A, 0x01, 0x03, targetHost.length.toByte()))
+        out.write(targetHost.toByteArray(Charsets.US_ASCII))
+        out.write(byteArrayOf(((targetPort shr 8) and 0xFF).toByte(), (targetPort and 0xFF).toByte()))
+        out.write(byteArrayOf(0x0D, 0x0A))
+        out.flush()
+
+        streamSocket.soTimeout = 0
+        streamSocket
     }
 }
 `

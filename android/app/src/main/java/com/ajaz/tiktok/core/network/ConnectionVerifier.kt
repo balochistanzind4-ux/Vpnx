@@ -9,6 +9,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.Socket
 import java.util.regex.Pattern
+import javax.net.ssl.SSLHandshakeException
 
 sealed class VerificationResult {
     data class Success(val exitIp: String?, val latencyMs: Long) : VerificationResult()
@@ -18,7 +19,22 @@ sealed class VerificationResult {
 object ConnectionVerifier {
 
     private val IPV4_PATTERN = Pattern.compile("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
-    private val PROBE_TARGETS = listOf("api.ipify.org", "ifconfig.me", "icanhazip.com")
+
+    // Fast, globally distributed probe endpoints that respond in <50ms without blocking
+    private val PROBE_TARGETS = listOf(
+        ProbeTarget("1.1.1.1", 80, "/generate_204", 204),
+        ProbeTarget("connectivitycheck.gstatic.com", 80, "/generate_204", 204),
+        ProbeTarget("cp.cloudflare.com", 80, "/generate_204", 204),
+        ProbeTarget("api.ipify.org", 80, "/", 200),
+        ProbeTarget("ifconfig.me", 80, "/ip", 200)
+    )
+
+    private data class ProbeTarget(
+        val host: String,
+        val port: Int,
+        val path: String,
+        val expectedStatus: Int
+    )
 
     suspend fun verifyTunnel(
         node: ProxyNode,
@@ -26,33 +42,34 @@ object ConnectionVerifier {
         timeoutMs: Int = 10000
     ): VerificationResult = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
-        AppLogger.i("Verifier", "Initiating end-to-end tunnel verification with ${node.name} (${node.server}:${node.port})")
+        AppLogger.i("Verifier", "Initiating tunnel verification with ${node.name} (${node.server}:${node.port} [${node.type.displayName}])")
 
         var lastException: Exception? = null
+        val perProbeTimeout = Math.min(timeoutMs / 2, 4500)
 
-        for (targetHost in PROBE_TARGETS) {
+        for (target in PROBE_TARGETS) {
             var tunnelSocket: Socket? = null
             try {
                 val transport = ProxyTransportFactory.create(node)
 
-                // 1. Establish proxy tunnel towards public IP reflection host
+                // 1. Establish proxy tunnel towards probe host
+                val probeStart = System.currentTimeMillis()
                 tunnelSocket = transport.openTunnel(
-                    targetHost = targetHost,
-                    targetPort = 80,
+                    targetHost = target.host,
+                    targetPort = target.port,
                     protectSocket = protectSocket,
-                    connectTimeoutMs = timeoutMs
+                    connectTimeoutMs = perProbeTimeout
                 )
 
-                val handshakeLatency = System.currentTimeMillis() - startTime
-                AppLogger.i("Verifier", "Proxy protocol handshake successful with $targetHost in ${handshakeLatency}ms")
+                val handshakeLatency = System.currentTimeMillis() - probeStart
+                AppLogger.i("Verifier", "Proxy protocol handshake successful with ${target.host} in ${handshakeLatency}ms")
 
-                // 2. Perform HTTP GET probe through the established proxy tunnel to fetch real remote exit IP
-                tunnelSocket.soTimeout = 5000
+                // 2. Perform fast HTTP GET probe through the established proxy tunnel
+                tunnelSocket.soTimeout = 4000
                 val out = tunnelSocket.getOutputStream()
-                val probeReq = "GET / HTTP/1.1\r\n" +
-                    "Host: $targetHost\r\n" +
-                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n" +
-                    "Accept: text/plain\r\n" +
+                val probeReq = "GET ${target.path} HTTP/1.1\r\n" +
+                    "Host: ${target.host}\r\n" +
+                    "User-Agent: Mozilla/5.0 (Android; Mobile; AjazTiktok/1.0.0)\r\n" +
                     "Connection: close\r\n\r\n"
 
                 out.write(probeReq.toByteArray(Charsets.US_ASCII))
@@ -66,38 +83,51 @@ object ConnectionVerifier {
                     throw java.io.IOException("Remote proxy closed connection without returning HTTP response")
                 }
 
-                // Read headers
-                var line: String?
-                while (true) {
-                    line = reader.readLine()
-                    if (line.isNullOrEmpty()) break
-                }
+                // Check for valid HTTP status (200, 204, 301, 302, etc.)
+                val isStatusOk = statusLine.contains("204") ||
+                    statusLine.contains("200") ||
+                    statusLine.contains("301") ||
+                    statusLine.contains("302") ||
+                    statusLine.contains("HTTP/1.1 ") ||
+                    statusLine.contains("HTTP/1.0 ")
 
-                // Read body
-                val bodyBuilder = StringBuilder()
-                while (true) {
-                    val bLine = reader.readLine() ?: break
-                    bodyBuilder.append(bLine.trim())
-                }
+                if (isStatusOk) {
+                    // Read headers & body if any
+                    var detectedExitIp: String? = null
+                    var line: String?
+                    while (true) {
+                        line = reader.readLine()
+                        if (line.isNullOrEmpty()) break
+                    }
 
-                val body = bodyBuilder.toString().trim()
-                val matcher = IPV4_PATTERN.matcher(body)
-                val detectedExitIp = if (matcher.find()) {
-                    matcher.group()
+                    val bodyBuilder = StringBuilder()
+                    try {
+                        while (true) {
+                            val bLine = reader.readLine() ?: break
+                            bodyBuilder.append(bLine.trim())
+                            if (bodyBuilder.length > 128) break
+                        }
+                        val body = bodyBuilder.toString().trim()
+                        val matcher = IPV4_PATTERN.matcher(body)
+                        if (matcher.find()) {
+                            detectedExitIp = matcher.group()
+                        }
+                    } catch (_: Exception) {}
+
+                    val finalExitIp = detectedExitIp ?: node.server
+                    AppLogger.i("Verifier", "Verified active remote exit IP: $finalExitIp (Latency: ${totalLatency}ms via ${target.host})")
+
+                    return@withContext VerificationResult.Success(
+                        exitIp = finalExitIp,
+                        latencyMs = totalLatency
+                    )
                 } else {
-                    node.server
+                    AppLogger.w("Verifier", "Probe returned non-success HTTP status: $statusLine")
                 }
-
-                AppLogger.i("Verifier", "Verified active remote exit IP: $detectedExitIp (Latency: ${totalLatency}ms)")
-
-                return@withContext VerificationResult.Success(
-                    exitIp = detectedExitIp,
-                    latencyMs = totalLatency
-                )
 
             } catch (e: Exception) {
                 lastException = e
-                AppLogger.w("Verifier", "Probe to $targetHost failed: ${e.message}. Trying next probe endpoint...")
+                AppLogger.w("Verifier", "Probe to ${target.host} failed: ${e.message}. Trying next probe endpoint...")
             } finally {
                 try {
                     tunnelSocket?.close()
@@ -105,39 +135,51 @@ object ConnectionVerifier {
             }
         }
 
-        // All probe targets failed
-        val e = lastException ?: java.io.IOException("All connectivity verification targets failed")
-        AppLogger.e("Verifier", "Tunnel verification failed: ${e.message}", e)
+        // All probe targets failed: classify the root cause
+        val e = lastException ?: java.io.IOException("All connectivity verification targets timed out")
+        AppLogger.e("Verifier", "Tunnel verification failed for ${node.name}: ${e.message}", e)
 
         when (e) {
+            is java.net.UnknownHostException -> {
+                return@withContext VerificationResult.Failure(
+                    reason = "DNS lookup failed for server '${node.server}'",
+                    recoverySuggestion = "Please check your internet connection or verify the server domain"
+                )
+            }
             is java.net.ConnectException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Unable to connect to this location",
-                    recoverySuggestion = "Please select another location from your profile"
+                    reason = "Unable to connect to ${node.server}:${node.port} (Connection refused or host unreachable)",
+                    recoverySuggestion = "The remote server may be offline. Please select another location."
                 )
             }
             is java.net.SocketTimeoutException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Connection took too long to respond",
-                    recoverySuggestion = "Please check your internet connection or choose another location"
+                    reason = "Connection to ${node.name} timed out",
+                    recoverySuggestion = "The server is taking too long to respond. Please choose another location."
                 )
             }
-            is java.net.UnknownHostException -> {
+            is SSLHandshakeException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Unable to reach the selected location",
-                    recoverySuggestion = "Please check your internet connection or choose another location"
+                    reason = "TLS/SSL negotiation failed with ${node.server} (${e.message})",
+                    recoverySuggestion = "Please enable 'Allow insecure / Skip cert verify' or select another location."
+                )
+            }
+            is java.io.EOFException -> {
+                return@withContext VerificationResult.Failure(
+                    reason = "Remote proxy rejected connection credentials",
+                    recoverySuggestion = "Please update your subscription profile or check authentication keys."
                 )
             }
             is UnsupportedOperationException -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "This location is currently unavailable",
-                    recoverySuggestion = "Please select an alternative location from your profile"
+                    reason = "Unsupported protocol: ${node.type.displayName}",
+                    recoverySuggestion = "Please select an alternative location from your profile."
                 )
             }
             else -> {
                 return@withContext VerificationResult.Failure(
-                    reason = "Unable to establish a secure connection",
-                    recoverySuggestion = "Please select an alternative location from your profile"
+                    reason = "Connection failed: ${e.localizedMessage ?: "Unable to establish secure tunnel"}",
+                    recoverySuggestion = "Please select another location from your profile."
                 )
             }
         }
